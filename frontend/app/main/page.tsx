@@ -10,6 +10,7 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
+import { Video, Search, Volume2, FolderOpen, ScrollText } from 'lucide-react';
 
 
 export default function Main() {
@@ -98,7 +99,7 @@ const handleDownload = () => {
       <div className="min-h-screen p-6">
         <Card className="max-w-xl mx-auto p-4 space-y-4">
           <CardContent>
-            <h2 className="text-2xl font-bold mb-8 text-center">🎥 YouTube Video Downloader</h2>
+            <h2 className="text-2xl font-bold mb-8 text-center"><Video className="inline h-6 w-6 mr-1" /> YouTube Video Downloader</h2>
             <Input
               placeholder="Paste YouTube video or playlist URL"
               value={url}
@@ -124,7 +125,7 @@ const handleDownload = () => {
             ) : (
               <>
                 <Button onClick={fetchInfo} disabled={loading} className="mt-4">
-                  {loading ? 'Loading formats...' : '🔍 Formats'}
+                  {loading ? 'Loading formats...' : <><Search className="inline h-4 w-4 mr-1" /> Formats</>}
                 </Button>
 
                 <div className="mt-4">
@@ -133,7 +134,7 @@ const handleDownload = () => {
                       <h4 className="font-semibold mb-4">Available Formats:</h4>
                       <div className="flex gap-4">
                         <div className="w-1/2">
-                          <h5 className="font-medium mb-2">🎥 Video Only</h5>
+                          <h5 className="font-medium mb-2"><Video className="inline h-4 w-4 mr-1" /> Video Only</h5>
                           <div className="grid gap-2">
                             {formats
                               .filter(f => f.type === 'video only' && f.approxSizeMB !== 'N/A' )
@@ -158,7 +159,7 @@ const handleDownload = () => {
                         </div>
 
                         <div className="w-1/2">
-                          <h5 className="font-medium mb-2">🔊 Audio Only</h5>
+                          <h5 className="font-medium mb-2"><Volume2 className="inline h-4 w-4 mr-1" /> Audio Only</h5>
                           <div className="grid gap-2">
                             {formats
                               .filter(f => f.type === 'audio only' && f.approxSizeMB !== 'N/A')
@@ -182,7 +183,7 @@ const handleDownload = () => {
                           </div>
                           <hr className="my-4" />
                           
-                          <h5 className="font-medium mb-2">🔊 Audio + Video </h5>
+                          <h5 className="font-medium mb-2"><Volume2 className="inline h-4 w-4 mr-1" /> Audio + Video</h5>
                           <div className="grid gap-2">
                             {formats
                               .filter(f => f.type === 'video+audio' && f.approxSizeMB !== 'N/A')
@@ -256,7 +257,7 @@ const handleDownload = () => {
 
             <div className="mt-8">
               <div className='flex items-center justify-between'>
-                <h3 className="font-bold text-lg mb-2">📜 Download History</h3>
+                <h3 className="font-bold text-lg mb-2"><ScrollText className="inline h-5 w-5 mr-1" /> Download History</h3>
                 <Button onClick={()=> router.push("/downloads")}>History</Button>
               </div>
               <ul className="list-disc list-inside space-y-1 text-sm">

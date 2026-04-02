@@ -49,7 +49,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useTheme } from "next-themes"
-import { Moon, Sun } from "lucide-react"
+import { Moon, Sun, Clapperboard } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { useEffect, useState } from "react"
 
@@ -69,7 +69,7 @@ export default function NavBar() {
           className="text-xl font-bold cursor-pointer"
           onClick={() => router.push("/")}
         >
-          🎬 YT Downloader
+          <Clapperboard className="inline h-5 w-5 mr-1" /> YT Downloader
         </div>
 
         <div className="flex items-center gap-4">
