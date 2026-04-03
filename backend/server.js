@@ -1,115 +1,7 @@
-// // yt-downloader-backend/server.js
-
-// const express = require('express');
-// const cors = require('cors');
-// const ytdl = require('ytdl-core');
-// const ytpl = require('ytpl');
-// const fs = require('fs');
-// const path = require('path');
-// const cron = require('node-cron');
-
-// const app = express();
-// const PORT = process.env.PORT || 5001;
-
-// app.use(cors());
-// app.use(express.json());
-
-// const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
-
-// if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
-
-// // Cleanup job: delete files older than 1 hour
-// cron.schedule('0 */1 * * * *', () => {
-//   const files = fs.readdirSync(DOWNLOAD_DIR);
-//   const now = Date.now();
-//   files.forEach(file => {
-//     const filePath = path.join(DOWNLOAD_DIR, file);
-//     const stats = fs.statSync(filePath);
-//     if (now - stats.ctimeMs > 60 * 60 * 1000) fs.unlinkSync(filePath);
-//   });
-// });
-
-// // Get video info & formats
-// app.post('/info', async (req, res) => {
-//   try {
-//     const { url } = req.body;
-//     const cleanUrl = url.includes('&') ? url.split('&')[0] : url;
-//     if (!ytdl.validateURL(cleanUrl)) return res.status(400).json({ error: 'Invalid URL' });
-//     console.log(cleanUrl)
-//     const info = await ytdl.getInfo(cleanUrl);
-//     const formats = ytdl.filterFormats(info.formats, 'audioandvideo');
-//     const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-//     res.json({ title: info.videoDetails.title, formats, audioFormats });
-//   } catch (err) {
-//     res.status(500).json({ error: 'Failed to fetch info', details: err.message });
-//   }
-// });
-
-// // Download single video (video or audio)
-// app.get('/download', async (req, res) => {
-//   try {
-//     const { url, itag } = req.query;
-//     if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid URL' });
-
-//     const info = await ytdl.getInfo(url);
-//     const format = ytdl.chooseFormat(info.formats, { quality: itag });
-//     const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-//     const filename = `${title}_${itag}.${format.container || 'mp4'}`;
-
-//     res.header('Content-Disposition', `attachment; filename="${filename}"`);
-//     ytdl(url, { format }).pipe(res);
-//   } catch (err) {
-//     res.status(500).json({ error: 'Download failed', details: err.message });
-//   }
-// });
-
-// // Download full playlist (audio/video)
-// app.post('/playlist', async (req, res) => {
-//   try {
-//     const { url, type } = req.body; // type = 'audio' or 'video'
-//     const playlist = await ytpl(url, { pages: Infinity });
-//     const downloads = [];
-
-//     for (const item of playlist.items) {
-//       const info = await ytdl.getInfo(item.url);
-//       const format = type === 'audio'
-//         ? ytdl.filterFormats(info.formats, 'audioonly')[0]
-//         : ytdl.filterFormats(info.formats, 'audioandvideo')[0];
-
-//       const title = item.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-//       const ext = format.container || (type === 'audio' ? 'mp3' : 'mp4');
-//       const filename = `${title}.${ext}`;
-//       const filePath = path.join(DOWNLOAD_DIR, filename);
-
-//       await new Promise((resolve, reject) => {
-//         ytdl(item.url, { format })
-//           .pipe(fs.createWriteStream(filePath))
-//           .on('finish', () => {
-//             downloads.push({ title: item.title, file: filename });
-//             resolve();
-//           })
-//           .on('error', reject);
-//       });
-//     }
-
-//     res.json({ message: 'Playlist download completed', downloads });
-//   } catch (err) {
-//     res.status(500).json({ error: 'Playlist download failed', details: err.message });
-//   }
-// });
-
-
-// app.listen(PORT, () => {
-//   console.log(`🚀 Server running on http://localhost:${PORT}`);
-// });
-
-
-
-// yt-downloader-backend/server.js
-
 const express = require('express');
 const cors = require('cors');
-const ytdl = require('@distube/ytdl-core'); // ✅ PATCHED
+const rateLimit = require('express-rate-limit');
+const ytdl = require('@distube/ytdl-core');
 const ytpl = require('ytpl');
 const fs = require('fs');
 const path = require('path');
@@ -118,57 +10,187 @@ const cron = require('node-cron');
 const app = express();
 const PORT = process.env.PORT || 5001;
 
-app.use(cors());
+// ---------------------------------------------------------------------------
+// CORS configuration
+// ---------------------------------------------------------------------------
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  process.env.FRONTEND_URL
+].filter(Boolean);
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true
+}));
+
 app.use(express.json());
 
+// ---------------------------------------------------------------------------
+// Simple request logger (morgan-style, no extra dependency)
+// ---------------------------------------------------------------------------
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
+  });
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+
+const infoLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many info requests, please try again later.' }
+});
+
+const downloadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many download requests, please try again later.' }
+});
+
+app.use(globalLimiter);
+
+// ---------------------------------------------------------------------------
+// Downloads directory
+// ---------------------------------------------------------------------------
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
-// 🧹 Cleanup old files hourly
+// ---------------------------------------------------------------------------
+// In-memory cache for video info (TTL = 10 min, max 100 entries)
+// ---------------------------------------------------------------------------
+const infoCache = new Map();
+const CACHE_TTL = 10 * 60 * 1000;
+const CACHE_MAX = 100;
+
+function getCachedInfo(key) {
+  const entry = infoCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL) {
+    infoCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedInfo(key, data) {
+  if (infoCache.size >= CACHE_MAX) {
+    // Evict the oldest entry (first key inserted)
+    const oldestKey = infoCache.keys().next().value;
+    infoCache.delete(oldestKey);
+  }
+  infoCache.set(key, { data, timestamp: Date.now() });
+}
+
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+const YOUTUBE_HOST_REGEX = /^(www\.)?youtube\.com$|^youtu\.be$|^m\.youtube\.com$/;
+
+function validateUrl(url) {
+  if (!url || typeof url !== 'string') {
+    return 'URL is required and must be a string.';
+  }
+  if (url.length > 500) {
+    return 'URL must not exceed 500 characters.';
+  }
+  try {
+    const parsed = new URL(url);
+    if (!YOUTUBE_HOST_REGEX.test(parsed.hostname)) {
+      return 'URL must be a valid YouTube domain (youtube.com, youtu.be, m.youtube.com).';
+    }
+  } catch {
+    return 'URL is not a valid URL.';
+  }
+  return null;
+}
+
+function validateItag(itag) {
+  if (!itag || !/^\d+$/.test(String(itag))) {
+    return 'itag is required and must be a numeric string.';
+  }
+  return null;
+}
+
+function validatePlaylistType(type) {
+  if (type !== 'audio' && type !== 'video') {
+    return 'type must be "audio" or "video".';
+  }
+  return null;
+}
+
+function cleanUrl(url) {
+  return url.includes('&') ? url.split('&')[0] : url;
+}
+
+// ---------------------------------------------------------------------------
+// Cleanup cron job -- delete files older than 1 hour
+// ---------------------------------------------------------------------------
 cron.schedule('0 */1 * * * *', () => {
-  const files = fs.readdirSync(DOWNLOAD_DIR);
-  const now = Date.now();
-  files.forEach(file => {
-    const filePath = path.join(DOWNLOAD_DIR, file);
-    const stats = fs.statSync(filePath);
-    if (now - stats.ctimeMs > 60 * 60 * 1000) fs.unlinkSync(filePath);
-  });
+  try {
+    const files = fs.readdirSync(DOWNLOAD_DIR);
+    const now = Date.now();
+    files.forEach(file => {
+      const filePath = path.join(DOWNLOAD_DIR, file);
+      const stats = fs.statSync(filePath);
+      if (now - stats.ctimeMs > 60 * 60 * 1000) {
+        fs.unlinkSync(filePath);
+        console.log(`Cleanup: deleted ${file}`);
+      }
+    });
+  } catch (err) {
+    console.log(`Cleanup error: ${err.message}`);
+  }
 });
 
-// // 📦 Get video info
-// app.post('/info', async (req, res) => {
-//   try {
-//     const { url } = req.body;
-//     const cleanUrl = url.includes('&') ? url.split('&')[0] : url;
+// ---------------------------------------------------------------------------
+// Health check
+// ---------------------------------------------------------------------------
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
 
-//     if (!ytdl.validateURL(cleanUrl)) {
-//       return res.status(400).json({ error: 'Invalid YouTube URL' });
-//     }
-
-//     const info = await ytdl.getInfo(cleanUrl);
-//     const formats = ytdl.filterFormats(info.formats, 'audioandvideo');
-//     const audioFormats = ytdl.filterFormats(info.formats, 'audioonly');
-
-//     res.json({ title: info.videoDetails.title, formats, audioFormats });
-//   } catch (err) {
-//     res.status(500).json({ error: 'Failed to fetch info', details: err.message });
-//   }
-// });
-
-// 📦 Get video info (yt-dlp -F style)
-app.post('/info', async (req, res) => {
+// ---------------------------------------------------------------------------
+// GET /info -- fetch video info and available formats
+// ---------------------------------------------------------------------------
+app.post('/info', infoLimiter, async (req, res) => {
   try {
     const { url } = req.body;
-    const cleanUrl = url.includes('&') ? url.split('&')[0] : url;
+    const urlError = validateUrl(url);
+    if (urlError) return res.status(400).json({ error: urlError });
 
-    if (!ytdl.validateURL(cleanUrl)) {
+    const cleaned = cleanUrl(url);
+
+    if (!ytdl.validateURL(cleaned)) {
       return res.status(400).json({ error: 'Invalid YouTube URL' });
     }
 
-    const info = await ytdl.getInfo(cleanUrl);
+    // Check cache first
+    const cached = getCachedInfo(cleaned);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const info = await ytdl.getInfo(cleaned);
     const formatsRaw = info.formats;
 
-    // Process formats like yt-dlp -F
     const allFormats = formatsRaw.map(format => ({
       itag: format.itag,
       mimeType: format.mimeType,
@@ -177,67 +199,54 @@ app.post('/info', async (req, res) => {
       bitrate: format.bitrate || format.audioBitrate,
       hasAudio: format.hasAudio,
       hasVideo: format.hasVideo,
-      approxSizeMB: format.contentLength ? (Number(format.contentLength) / (1024 * 1024)).toFixed(2) : 'N/A',
+      approxSizeMB: format.contentLength
+        ? (Number(format.contentLength) / (1024 * 1024)).toFixed(2)
+        : 'N/A',
       type: format.hasAudio && format.hasVideo
         ? 'video+audio'
         : format.hasVideo
-        ? 'video only'
-        : 'audio only'
+          ? 'video only'
+          : 'audio only'
     }));
 
-    // Sort formats by resolution and type
     const sortedFormats = allFormats.sort((a, b) => {
       const aRes = parseInt(a.qualityLabel) || 0;
       const bRes = parseInt(b.qualityLabel) || 0;
       return bRes - aRes;
     });
 
-    res.json({
+    const responseData = {
       title: info.videoDetails.title,
       thumbnail: info.videoDetails.thumbnails?.[0]?.url || '',
       formats: sortedFormats
-    });
+    };
+
+    setCachedInfo(cleaned, responseData);
+    res.json(responseData);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch info', details: err.message });
   }
 });
 
-
-// // 📥 Download a single video or audio
-// app.get('/download', async (req, res) => {
-//   try {
-//     const { url, itag } = req.query;
-//     if (!ytdl.validateURL(url)) return res.status(400).json({ error: 'Invalid URL' });
-
-//     const info = await ytdl.getInfo(url);
-//     // const format = ytdl.chooseFormat(info.formats, { quality: itag });
-//     if (!format || !format.contentLength) {
-//       return res.status(400).json({ error: 'Invalid or unsupported format selected' });
-//     }
-
-//     const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-//     const filename = `${title}_${itag}.${format.container || 'mp4'}`;
-
-//     res.header('Content-Disposition', `attachment; filename="${filename}"`);
-//     ytdl(url, { format }).pipe(res);
-//   } catch (err) {
-//     res.status(500).json({ error: 'Download failed', details: err.message });
-//   }
-// });
-
-
-// 📥 Download a single video or audio
-app.get('/download', async (req, res) => {
+// ---------------------------------------------------------------------------
+// GET /download -- stream a single video or audio directly to the client
+// ---------------------------------------------------------------------------
+app.get('/download', downloadLimiter, async (req, res) => {
   try {
     const { url, itag } = req.query;
+
+    const urlError = validateUrl(url);
+    if (urlError) return res.status(400).json({ error: urlError });
+
+    const itagError = validateItag(itag);
+    if (itagError) return res.status(400).json({ error: itagError });
 
     if (!ytdl.validateURL(url)) {
       return res.status(400).json({ error: 'Invalid URL' });
     }
 
     const info = await ytdl.getInfo(url);
-    const formats = info.formats;
-    const format = formats.find(f => String(f.itag) === String(itag));
+    const format = info.formats.find(f => String(f.itag) === String(itag));
 
     if (!format) {
       return res.status(404).json({ error: 'Format not found for the given itag' });
@@ -253,11 +262,149 @@ app.get('/download', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// GET /download-progress -- SSE endpoint for download progress tracking
+// ---------------------------------------------------------------------------
+app.get('/download-progress', downloadLimiter, async (req, res) => {
+  const { url, itag } = req.query;
 
-// 🎵 Download an entire playlist
+  const urlError = validateUrl(url);
+  if (urlError) {
+    return res.status(400).json({ error: urlError });
+  }
+
+  const itagError = validateItag(itag);
+  if (itagError) {
+    return res.status(400).json({ error: itagError });
+  }
+
+  if (!ytdl.validateURL(url)) {
+    return res.status(400).json({ error: 'Invalid URL' });
+  }
+
+  // SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  function sendEvent(data) {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  let aborted = false;
+  let stream = null;
+
+  req.on('close', () => {
+    aborted = true;
+    if (stream) {
+      stream.destroy();
+    }
+  });
+
+  try {
+    const info = await ytdl.getInfo(url);
+    const format = info.formats.find(f => String(f.itag) === String(itag));
+
+    if (!format) {
+      sendEvent({ type: 'error', message: 'Format not found for the given itag' });
+      return res.end();
+    }
+
+    const contentLength = Number(format.contentLength) || 0;
+    const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const ext = format.container || 'mp4';
+    const filename = `${title}_${itag}.${ext}`;
+    const filePath = path.join(DOWNLOAD_DIR, filename);
+
+    stream = ytdl(url, { format });
+    const fileStream = fs.createWriteStream(filePath);
+
+    let downloadedBytes = 0;
+    let lastSent = 0;
+    const THROTTLE_MS = 500;
+
+    stream.on('data', (chunk) => {
+      if (aborted) return;
+      downloadedBytes += chunk.length;
+
+      const now = Date.now();
+      if (now - lastSent >= THROTTLE_MS) {
+        lastSent = now;
+        const downloadedMB = (downloadedBytes / (1024 * 1024)).toFixed(2);
+        const totalMB = contentLength
+          ? (contentLength / (1024 * 1024)).toFixed(2)
+          : 'unknown';
+        const percent = contentLength
+          ? Math.min(((downloadedBytes / contentLength) * 100).toFixed(1), 100)
+          : null;
+
+        sendEvent({ type: 'progress', percent, downloadedMB, totalMB });
+      }
+    });
+
+    stream.pipe(fileStream);
+
+    fileStream.on('finish', () => {
+      if (aborted) return;
+      sendEvent({ type: 'complete', filename });
+      res.end();
+    });
+
+    stream.on('error', (err) => {
+      if (aborted) return;
+      sendEvent({ type: 'error', message: err.message });
+      res.end();
+    });
+
+    fileStream.on('error', (err) => {
+      if (aborted) return;
+      sendEvent({ type: 'error', message: err.message });
+      res.end();
+    });
+  } catch (err) {
+    if (!aborted) {
+      sendEvent({ type: 'error', message: err.message });
+      res.end();
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /download-file/:filename -- serve a downloaded file from DOWNLOAD_DIR
+// ---------------------------------------------------------------------------
+app.get('/download-file/:filename', (req, res) => {
+  const { filename } = req.params;
+
+  // Path traversal protection
+  if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return res.status(400).json({ error: 'Invalid filename.' });
+  }
+
+  const filePath = path.join(DOWNLOAD_DIR, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found.' });
+  }
+
+  res.header('Content-Disposition', `attachment; filename="${filename}"`);
+  res.sendFile(filePath);
+});
+
+// ---------------------------------------------------------------------------
+// POST /playlist -- download an entire playlist
+// ---------------------------------------------------------------------------
 app.post('/playlist', async (req, res) => {
   try {
     const { url, type } = req.body;
+
+    const urlError = validateUrl(url);
+    if (urlError) return res.status(400).json({ error: urlError });
+
+    const typeError = validatePlaylistType(type);
+    if (typeError) return res.status(400).json({ error: typeError });
+
     const playlist = await ytpl(url, { pages: Infinity });
     const downloads = [];
 
@@ -289,6 +436,9 @@ app.post('/playlist', async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
