@@ -41,7 +41,7 @@ export default function DownloadsPage() {
             <FolderOpen className="inline h-6 w-6 mr-1" /> Your Download History
           </h2>
           <div className="flex items-center justify-between mb-4">
-            <Link href="/main" className="text-blue-600 underline">
+            <Link href="/main" className="text-primary underline">
               &larr; Back to Home
             </Link>
             {history.length > 0 && (

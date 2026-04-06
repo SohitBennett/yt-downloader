@@ -20,7 +20,7 @@ export default function NavBar() {
   }, [])
 
   return (
-    <div className="border-b shadow-sm bg-white dark:bg-zinc-900">
+    <div className="border-b shadow-sm bg-card">
       <div className="flex items-center justify-between px-6 py-4">
         <div
           className="text-xl font-bold cursor-pointer"

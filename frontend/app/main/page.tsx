@@ -251,7 +251,7 @@ export default function Main() {
                                     <span className="font-medium">
                                       {f.qualityLabel} - {f.type}
                                     </span>
-                                    <span className="text-xs text-gray-500">
+                                    <span className="text-xs text-muted-foreground">
                                       {f.container}, ~{f.approxSizeMB} MB
                                     </span>
                                   </div>
@@ -278,7 +278,7 @@ export default function Main() {
                                     <span className="font-medium">
                                       {f.qualityLabel} - {f.type}
                                     </span>
-                                    <span className="text-xs text-gray-500">
+                                    <span className="text-xs text-muted-foreground">
                                       {f.container}, ~{f.approxSizeMB} MB
                                     </span>
                                   </div>
@@ -304,7 +304,7 @@ export default function Main() {
                                     <span className="font-medium">
                                       {f.qualityLabel} - {f.type}
                                     </span>
-                                    <span className="text-xs text-gray-500">
+                                    <span className="text-xs text-muted-foreground">
                                       {f.container}, ~{f.approxSizeMB} MB
                                     </span>
                                   </div>
@@ -379,7 +379,7 @@ export default function Main() {
               <ul className="list-disc list-inside space-y-1 text-sm">
                 {history.slice(0, 5).map((h, i) => (
                   <li key={i}>
-                    {h.title} <span className="text-gray-500">({h.type})</span>
+                    {h.title} <span className="text-muted-foreground">({h.type})</span>
                   </li>
                 ))}
               </ul>
