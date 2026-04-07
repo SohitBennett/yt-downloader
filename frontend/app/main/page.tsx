@@ -36,7 +36,7 @@ interface ProgressState {
   percent: number;
   downloadedMB: string;
   totalMB: string;
-  phase: 'downloading' | 'merging' | 'complete';
+  phase: 'downloading' | 'merging' | 'converting' | 'complete';
 }
 
 export default function Main() {
@@ -51,6 +51,7 @@ export default function Main() {
   const [videoTitle, setVideoTitle] = useState<string>('');
   const [thumbnailUrl, setThumbnailUrl] = useState<string>('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
+  const [convertTo, setConvertTo] = useState<string>('');
   const router = useRouter();
 
   // Load history from localStorage on mount
@@ -110,9 +111,10 @@ export default function Main() {
     saveToHistory(entry);
     toast.success('Download started!');
 
-    const eventSource = new EventSource(
-      `${BASE_URL}/download-progress?url=${encodeURIComponent(url)}&itag=${selectedItag}`
-    );
+    const sseUrl = `${BASE_URL}/download-progress?url=${encodeURIComponent(url)}&itag=${selectedItag}${
+      convertTo ? `&convertTo=${convertTo}` : ''
+    }`;
+    const eventSource = new EventSource(sseUrl);
 
     let completed = false;
 
@@ -323,6 +325,33 @@ export default function Main() {
                   )}
                 </div>
 
+                {/* Convert to selector */}
+                <div className="mt-4 flex items-center gap-3">
+                  <label htmlFor="convertTo" className="text-sm font-medium">
+                    Convert to:
+                  </label>
+                  <select
+                    id="convertTo"
+                    value={convertTo}
+                    onChange={(e) => setConvertTo(e.target.value)}
+                    className="flex-1 h-9 rounded-md border border-input bg-card text-foreground px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="">Original (no conversion)</option>
+                    <optgroup label="Audio">
+                      <option value="mp3">MP3</option>
+                      <option value="m4a">M4A</option>
+                      <option value="wav">WAV</option>
+                      <option value="ogg">OGG</option>
+                      <option value="flac">FLAC</option>
+                    </optgroup>
+                    <optgroup label="Video">
+                      <option value="mp4">MP4</option>
+                      <option value="webm">WebM</option>
+                      <option value="mkv">MKV (remux)</option>
+                    </optgroup>
+                  </select>
+                </div>
+
                 {/* Progress bar */}
                 {progress && (
                   <div className="mt-4 space-y-2">
@@ -330,7 +359,9 @@ export default function Main() {
                       <span>
                         {progress.phase === 'merging'
                           ? 'Merging audio + video…'
-                          : `${progress.percent}%`}
+                          : progress.phase === 'converting'
+                            ? `Converting to ${convertTo.toUpperCase()}…`
+                            : `${progress.percent}%`}
                       </span>
                       <span>{progress.downloadedMB} / {progress.totalMB} MB</span>
                     </div>

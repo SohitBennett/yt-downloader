@@ -138,6 +138,66 @@ function validatePlaylistType(type) {
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Format conversion presets -- maps target extension to ffmpeg codec args.
+// Audio targets strip video. Video targets re-encode (mp4/webm) or remux (mkv).
+// ---------------------------------------------------------------------------
+const CONVERSION_PRESETS = {
+  // Audio
+  mp3:  { kind: 'audio', args: ['-vn', '-c:a', 'libmp3lame', '-b:a', '192k'] },
+  m4a:  { kind: 'audio', args: ['-vn', '-c:a', 'aac', '-b:a', '192k'] },
+  wav:  { kind: 'audio', args: ['-vn', '-c:a', 'pcm_s16le'] },
+  ogg:  { kind: 'audio', args: ['-vn', '-c:a', 'libvorbis', '-q:a', '5'] },
+  flac: { kind: 'audio', args: ['-vn', '-c:a', 'flac'] },
+  // Video
+  mp4:  { kind: 'video', args: ['-c:v', 'libx264', '-preset', 'fast', '-c:a', 'aac', '-b:a', '192k'] },
+  webm: { kind: 'video', args: ['-c:v', 'libvpx-vp9', '-b:v', '1M', '-c:a', 'libopus'] },
+  mkv:  { kind: 'video', args: ['-c', 'copy'] },
+};
+
+function validateConvertTo(convertTo) {
+  if (convertTo === undefined || convertTo === null || convertTo === '') return null;
+  if (typeof convertTo !== 'string') return 'convertTo must be a string.';
+  if (!CONVERSION_PRESETS[convertTo]) {
+    return `convertTo must be one of: ${Object.keys(CONVERSION_PRESETS).join(', ')}.`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Convert a downloaded file to a target format using ffmpeg.
+// Deletes the source file on success and returns the new file path.
+// ---------------------------------------------------------------------------
+async function convertFormat({ inputPath, targetExt, isAborted, onStart }) {
+  const preset = CONVERSION_PRESETS[targetExt];
+  const dir = path.dirname(inputPath);
+  const base = path.basename(inputPath, path.extname(inputPath));
+  const outputPath = path.join(dir, `${base}.${targetExt}`);
+
+  if (onStart) onStart();
+
+  await new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, [
+      '-y',
+      '-i', inputPath,
+      ...preset.args,
+      '-loglevel', 'error',
+      outputPath,
+    ]);
+    ff.on('error', reject);
+    ff.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg conversion exited with code ${code}`));
+    });
+    if (isAborted && isAborted()) ff.kill('SIGKILL');
+  });
+
+  // Remove the intermediate file
+  try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch {}
+
+  return outputPath;
+}
+
 function cleanUrl(url) {
   return url.includes('&') ? url.split('&')[0] : url;
 }
@@ -381,7 +441,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 // GET /download-progress -- SSE endpoint for download progress tracking
 // ---------------------------------------------------------------------------
 app.get('/download-progress', downloadLimiter, async (req, res) => {
-  const { url, itag } = req.query;
+  const { url, itag, convertTo } = req.query;
 
   const urlError = validateUrl(url);
   if (urlError) {
@@ -391,6 +451,11 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
   const itagError = validateItag(itag);
   if (itagError) {
     return res.status(400).json({ error: itagError });
+  }
+
+  const convertError = validateConvertTo(convertTo);
+  if (convertError) {
+    return res.status(400).json({ error: convertError });
   }
 
   if (!ytdl.validateURL(url)) {
@@ -418,16 +483,51 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     }
   });
 
+  // Helper to run an optional conversion phase after a download/merge completes.
+  // Returns the final filename to serve (post-conversion if applicable).
+  const maybeConvert = async (filePath, currentExt) => {
+    if (!convertTo || convertTo === currentExt) {
+      return path.basename(filePath);
+    }
+    sendEvent({
+      type: 'progress',
+      phase: 'converting',
+      percent: 97,
+      downloadedMB: '0',
+      totalMB: '0',
+    });
+    const finalPath = await convertFormat({
+      inputPath: filePath,
+      targetExt: convertTo,
+      isAborted: () => aborted,
+    });
+    return path.basename(finalPath);
+  };
+
   try {
     const info = await ytdl.getInfo(url);
-    const format = info.formats.find(f => String(f.itag) === String(itag));
+    const requestedFormat = info.formats.find(f => String(f.itag) === String(itag));
 
-    if (!format) {
+    if (!requestedFormat) {
       sendEvent({ type: 'error', message: 'Format not found for the given itag' });
       return res.end();
     }
 
     const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const targetIsAudio = convertTo && CONVERSION_PRESETS[convertTo].kind === 'audio';
+
+    // -----------------------------------------------------------------------
+    // Smart routing: if user wants audio output but picked a video itag,
+    // skip the video stream entirely and download best audio-only instead.
+    // -----------------------------------------------------------------------
+    let format = requestedFormat;
+    if (targetIsAudio && requestedFormat.hasVideo) {
+      const audioOnly = info.formats.filter(f => f.hasAudio && !f.hasVideo);
+      if (audioOnly.length > 0) {
+        format = audioOnly.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+      }
+    }
+
     const isVideoOnly = format.hasVideo && !format.hasAudio;
 
     // -----------------------------------------------------------------------
@@ -441,8 +541,8 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
       }
 
       const ext = format.container || 'mp4';
-      const filename = `${title}_${itag}_merged.${ext}`;
-      const filePath = path.join(DOWNLOAD_DIR, filename);
+      const mergedFilename = `${title}_${itag}_merged.${ext}`;
+      const filePath = path.join(DOWNLOAD_DIR, mergedFilename);
 
       try {
         await downloadAndMerge({
@@ -458,7 +558,9 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
         });
 
         if (aborted) return;
-        sendEvent({ type: 'complete', filename });
+        const finalFilename = await maybeConvert(filePath, ext);
+        if (aborted) return;
+        sendEvent({ type: 'complete', filename: finalFilename });
         res.end();
       } catch (err) {
         if (!aborted) {
@@ -474,7 +576,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     // -----------------------------------------------------------------------
     const contentLength = Number(format.contentLength) || 0;
     const ext = format.container || 'mp4';
-    const filename = `${title}_${itag}.${ext}`;
+    const filename = `${title}_${format.itag}.${ext}`;
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
     stream = ytdl(url, { format });
@@ -495,8 +597,12 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
         const totalMB = contentLength
           ? (contentLength / (1024 * 1024)).toFixed(2)
           : 'unknown';
-        const percent = contentLength
-          ? Math.min(((downloadedBytes / contentLength) * 100).toFixed(1), 100)
+        // Cap at 95% if we'll convert afterwards
+        const rawPercent = contentLength
+          ? Math.min((downloadedBytes / contentLength) * 100, 100)
+          : null;
+        const percent = rawPercent !== null
+          ? Number((convertTo ? Math.min(rawPercent * 0.95, 95) : rawPercent).toFixed(1))
           : null;
 
         sendEvent({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB });
@@ -505,10 +611,19 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
 
     stream.pipe(fileStream);
 
-    fileStream.on('finish', () => {
+    fileStream.on('finish', async () => {
       if (aborted) return;
-      sendEvent({ type: 'complete', filename });
-      res.end();
+      try {
+        const finalFilename = await maybeConvert(filePath, ext);
+        if (aborted) return;
+        sendEvent({ type: 'complete', filename: finalFilename });
+        res.end();
+      } catch (err) {
+        if (!aborted) {
+          sendEvent({ type: 'error', message: err.message });
+          res.end();
+        }
+      }
     });
 
     stream.on('error', (err) => {
