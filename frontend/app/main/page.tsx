@@ -36,6 +36,7 @@ interface ProgressState {
   percent: number;
   downloadedMB: string;
   totalMB: string;
+  phase: 'downloading' | 'merging' | 'complete';
 }
 
 export default function Main() {
@@ -98,7 +99,7 @@ export default function Main() {
     }
 
     setDownloadLoading(true);
-    setProgress({ percent: 0, downloadedMB: '0', totalMB: '0' });
+    setProgress({ percent: 0, downloadedMB: '0', totalMB: '0', phase: 'downloading' });
 
     const entry: HistoryEntry = {
       title: videoTitle || url,
@@ -113,37 +114,42 @@ export default function Main() {
       `${BASE_URL}/download-progress?url=${encodeURIComponent(url)}&itag=${selectedItag}`
     );
 
+    let completed = false;
+
     eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.percent !== undefined) {
+
+        if (data.type === 'progress') {
           setProgress({
-            percent: data.percent,
+            percent: data.percent ?? 0,
             downloadedMB: data.downloadedMB || '0',
             totalMB: data.totalMB || '0',
+            phase: data.phase || 'downloading',
           });
+        } else if (data.type === 'complete') {
+          completed = true;
+          if (data.filename) {
+            window.open(`${BASE_URL}/download-file/${data.filename}`);
+          }
+          eventSource.close();
+          setDownloadLoading(false);
+          setProgress(null);
+          toast.success('Download complete!');
+        } else if (data.type === 'error') {
+          completed = true;
+          eventSource.close();
+          setDownloadLoading(false);
+          setProgress(null);
+          toast.error(data.message || 'Download failed');
         }
       } catch {
         // ignore parse errors
       }
     };
 
-    eventSource.addEventListener('complete', (event: MessageEvent) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.filename) {
-          window.open(`${BASE_URL}/download-file/${data.filename}`);
-        }
-      } catch {
-        // fallback
-      }
-      eventSource.close();
-      setDownloadLoading(false);
-      setProgress(null);
-      toast.success('Download complete!');
-    });
-
     eventSource.onerror = () => {
+      if (completed) return;
       eventSource.close();
       toast.error('Download failed');
       setDownloadLoading(false);
@@ -235,7 +241,7 @@ export default function Main() {
                       <div className="flex gap-4">
                         <div className="w-1/2">
                           <h5 className="font-medium mb-2">
-                            <Video className="inline h-4 w-4 mr-1" /> Video Only
+                            <Video className="inline h-4 w-4 mr-1" /> Video <span className="text-xs text-muted-foreground font-normal">(audio auto-merged)</span>
                           </h5>
                           <div className="grid gap-2">
                             {formats
@@ -321,7 +327,11 @@ export default function Main() {
                 {progress && (
                   <div className="mt-4 space-y-2">
                     <div className="flex justify-between text-sm">
-                      <span>{progress.percent}%</span>
+                      <span>
+                        {progress.phase === 'merging'
+                          ? 'Merging audio + video…'
+                          : `${progress.percent}%`}
+                      </span>
                       <span>{progress.downloadedMB} / {progress.totalMB} MB</span>
                     </div>
                     <div className="w-full bg-muted rounded h-2 overflow-hidden">

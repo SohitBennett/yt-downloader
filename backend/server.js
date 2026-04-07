@@ -6,6 +6,8 @@ const ytpl = require('ytpl');
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -138,6 +140,119 @@ function validatePlaylistType(type) {
 
 function cleanUrl(url) {
   return url.includes('&') ? url.split('&')[0] : url;
+}
+
+// ---------------------------------------------------------------------------
+// Pick the best audio-only format that matches a video format's container,
+// so ffmpeg can mux with `-c copy` (no re-encode).
+// ---------------------------------------------------------------------------
+function pickBestAudioForVideo(formats, videoFormat) {
+  const audioOnly = formats.filter(f => f.hasAudio && !f.hasVideo);
+  if (audioOnly.length === 0) return null;
+  const matching = audioOnly.filter(f => f.container === videoFormat.container);
+  const pool = matching.length > 0 ? matching : audioOnly;
+  return pool.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+}
+
+// ---------------------------------------------------------------------------
+// Download video-only + audio-only streams in parallel and mux with ffmpeg.
+// onProgress receives { phase, percent, downloadedMB, totalMB }.
+// ---------------------------------------------------------------------------
+async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onProgress, isAborted }) {
+  const tempVideo = `${outputPath}.video.tmp`;
+  const tempAudio = `${outputPath}.audio.tmp`;
+
+  const videoSize = Number(videoFormat.contentLength) || 0;
+  const audioSize = Number(audioFormat.contentLength) || 0;
+  const totalSize = videoSize + audioSize;
+
+  let videoBytes = 0;
+  let audioBytes = 0;
+  let throttleLast = 0;
+
+  const reportDownloadProgress = () => {
+    const now = Date.now();
+    if (now - throttleLast < 500) return;
+    throttleLast = now;
+    const downloaded = videoBytes + audioBytes;
+    const downloadedMB = (downloaded / (1024 * 1024)).toFixed(2);
+    const totalMB = totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown';
+    // Cap download phase at 95% so the merge phase has the last 5%.
+    const percent = totalSize
+      ? Number(Math.min((downloaded / totalSize) * 95, 95).toFixed(1))
+      : null;
+    onProgress({ phase: 'downloading', percent, downloadedMB, totalMB });
+  };
+
+  const cleanupTemps = () => {
+    try { if (fs.existsSync(tempVideo)) fs.unlinkSync(tempVideo); } catch {}
+    try { if (fs.existsSync(tempAudio)) fs.unlinkSync(tempAudio); } catch {}
+  };
+
+  const downloadStream = (format, dest, onByte) => new Promise((resolve, reject) => {
+    const stream = ytdl(url, { format });
+    const file = fs.createWriteStream(dest);
+    stream.on('data', (chunk) => {
+      if (isAborted()) {
+        stream.destroy();
+        return;
+      }
+      onByte(chunk.length);
+    });
+    stream.on('error', reject);
+    file.on('error', reject);
+    file.on('finish', resolve);
+    stream.pipe(file);
+  });
+
+  try {
+    await Promise.all([
+      downloadStream(videoFormat, tempVideo, (n) => { videoBytes += n; reportDownloadProgress(); }),
+      downloadStream(audioFormat, tempAudio, (n) => { audioBytes += n; reportDownloadProgress(); }),
+    ]);
+  } catch (err) {
+    cleanupTemps();
+    throw err;
+  }
+
+  if (isAborted()) {
+    cleanupTemps();
+    return;
+  }
+
+  // Merge phase
+  onProgress({
+    phase: 'merging',
+    percent: 95,
+    downloadedMB: ((videoBytes + audioBytes) / (1024 * 1024)).toFixed(2),
+    totalMB: totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown',
+  });
+
+  await new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, [
+      '-y',
+      '-i', tempVideo,
+      '-i', tempAudio,
+      '-c', 'copy',
+      '-loglevel', 'error',
+      outputPath,
+    ]);
+    ff.on('error', reject);
+    ff.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg exited with code ${code}`));
+    });
+    if (isAborted()) ff.kill('SIGKILL');
+  });
+
+  cleanupTemps();
+
+  onProgress({
+    phase: 'complete',
+    percent: 100,
+    downloadedMB: totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : '0',
+    totalMB: totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -312,8 +427,52 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
       return res.end();
     }
 
-    const contentLength = Number(format.contentLength) || 0;
     const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const isVideoOnly = format.hasVideo && !format.hasAudio;
+
+    // -----------------------------------------------------------------------
+    // Branch 1: video-only format -> download + audio + ffmpeg merge
+    // -----------------------------------------------------------------------
+    if (isVideoOnly) {
+      const audioFormat = pickBestAudioForVideo(info.formats, format);
+      if (!audioFormat) {
+        sendEvent({ type: 'error', message: 'No audio format available to merge.' });
+        return res.end();
+      }
+
+      const ext = format.container || 'mp4';
+      const filename = `${title}_${itag}_merged.${ext}`;
+      const filePath = path.join(DOWNLOAD_DIR, filename);
+
+      try {
+        await downloadAndMerge({
+          url,
+          videoFormat: format,
+          audioFormat,
+          outputPath: filePath,
+          isAborted: () => aborted,
+          onProgress: (data) => {
+            if (aborted) return;
+            sendEvent({ type: 'progress', ...data });
+          },
+        });
+
+        if (aborted) return;
+        sendEvent({ type: 'complete', filename });
+        res.end();
+      } catch (err) {
+        if (!aborted) {
+          sendEvent({ type: 'error', message: err.message });
+          res.end();
+        }
+      }
+      return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Branch 2: pre-muxed (video+audio) or audio-only -> single stream
+    // -----------------------------------------------------------------------
+    const contentLength = Number(format.contentLength) || 0;
     const ext = format.container || 'mp4';
     const filename = `${title}_${itag}.${ext}`;
     const filePath = path.join(DOWNLOAD_DIR, filename);
@@ -340,7 +499,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
           ? Math.min(((downloadedBytes / contentLength) * 100).toFixed(1), 100)
           : null;
 
-        sendEvent({ type: 'progress', percent, downloadedMB, totalMB });
+        sendEvent({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB });
       }
     });
 
