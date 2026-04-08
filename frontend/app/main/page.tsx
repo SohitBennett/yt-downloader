@@ -36,7 +36,7 @@ interface ProgressState {
   percent: number;
   downloadedMB: string;
   totalMB: string;
-  phase: 'downloading' | 'merging' | 'converting' | 'complete';
+  phase: 'downloading' | 'merging' | 'converting' | 'trimming' | 'complete';
 }
 
 export default function Main() {
@@ -52,6 +52,8 @@ export default function Main() {
   const [thumbnailUrl, setThumbnailUrl] = useState<string>('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [convertTo, setConvertTo] = useState<string>('');
+  const [trimStart, setTrimStart] = useState<string>('');
+  const [trimEnd, setTrimEnd] = useState<string>('');
   const router = useRouter();
 
   // Load history from localStorage on mount
@@ -111,10 +113,11 @@ export default function Main() {
     saveToHistory(entry);
     toast.success('Download started!');
 
-    const sseUrl = `${BASE_URL}/download-progress?url=${encodeURIComponent(url)}&itag=${selectedItag}${
-      convertTo ? `&convertTo=${convertTo}` : ''
-    }`;
-    const eventSource = new EventSource(sseUrl);
+    const params = new URLSearchParams({ url, itag: selectedItag });
+    if (convertTo) params.set('convertTo', convertTo);
+    if (trimStart) params.set('start', trimStart);
+    if (trimEnd) params.set('end', trimEnd);
+    const eventSource = new EventSource(`${BASE_URL}/download-progress?${params.toString()}`);
 
     let completed = false;
 
@@ -325,6 +328,28 @@ export default function Main() {
                   )}
                 </div>
 
+                {/* Trim inputs */}
+                <div className="mt-4 space-y-2">
+                  <label className="text-sm font-medium block">
+                    Trim <span className="text-xs text-muted-foreground font-normal">(optional, format: 1:23 or 0:01:23)</span>
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <Input
+                      placeholder="Start (e.g. 0:30)"
+                      value={trimStart}
+                      onChange={(e) => setTrimStart(e.target.value)}
+                      className="flex-1"
+                    />
+                    <span className="text-muted-foreground text-sm">to</span>
+                    <Input
+                      placeholder="End (e.g. 1:45)"
+                      value={trimEnd}
+                      onChange={(e) => setTrimEnd(e.target.value)}
+                      className="flex-1"
+                    />
+                  </div>
+                </div>
+
                 {/* Convert to selector */}
                 <div className="mt-4 flex items-center gap-3">
                   <label htmlFor="convertTo" className="text-sm font-medium">
@@ -361,7 +386,9 @@ export default function Main() {
                           ? 'Merging audio + video…'
                           : progress.phase === 'converting'
                             ? `Converting to ${convertTo.toUpperCase()}…`
-                            : `${progress.percent}%`}
+                            : progress.phase === 'trimming'
+                              ? 'Trimming clip…'
+                              : `${progress.percent}%`}
                       </span>
                       <span>{progress.downloadedMB} / {progress.totalMB} MB</span>
                     </div>

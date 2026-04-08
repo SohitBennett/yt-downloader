@@ -165,36 +165,93 @@ function validateConvertTo(convertTo) {
 }
 
 // ---------------------------------------------------------------------------
-// Convert a downloaded file to a target format using ffmpeg.
-// Deletes the source file on success and returns the new file path.
+// Time parsing -- accepts "83", "1:23", "0:01:23" (returns seconds, or null).
 // ---------------------------------------------------------------------------
-async function convertFormat({ inputPath, targetExt, isAborted, onStart }) {
-  const preset = CONVERSION_PRESETS[targetExt];
+function parseTime(t) {
+  if (t === undefined || t === null || t === '') return null;
+  const s = String(t).trim();
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const n = parseFloat(s);
+    return n >= 0 ? n : null;
+  }
+  const parts = s.split(':');
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (!parts.every(p => /^\d+(\.\d+)?$/.test(p))) return null;
+  let seconds;
+  if (parts.length === 3) {
+    seconds = parseInt(parts[0], 10) * 3600 + parseInt(parts[1], 10) * 60 + parseFloat(parts[2]);
+  } else {
+    seconds = parseInt(parts[0], 10) * 60 + parseFloat(parts[1]);
+  }
+  return seconds >= 0 ? seconds : null;
+}
+
+function validateTrim(start, end) {
+  const startProvided = start !== undefined && start !== '';
+  const endProvided = end !== undefined && end !== '';
+  if (!startProvided && !endProvided) return null;
+
+  if (startProvided && parseTime(start) === null) {
+    return 'start must be a number (seconds) or time format like 1:23 or 0:01:23.';
+  }
+  if (endProvided && parseTime(end) === null) {
+    return 'end must be a number (seconds) or time format like 1:23 or 0:01:23.';
+  }
+  if (startProvided && endProvided) {
+    const s = parseTime(start);
+    const e = parseTime(end);
+    if (e <= s) return 'end must be greater than start.';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Post-process a downloaded file: optional trim (start/end seconds) and/or
+// optional format conversion. Both operations run in a single ffmpeg pass when
+// combined. Deletes the source file on success and returns the new file path.
+// ---------------------------------------------------------------------------
+async function processFile({ inputPath, targetExt, startSec, endSec, isAborted }) {
+  const trimRequested = startSec !== null || endSec !== null;
+  const convertRequested = !!targetExt;
+  if (!trimRequested && !convertRequested) return inputPath;
+
   const dir = path.dirname(inputPath);
   const base = path.basename(inputPath, path.extname(inputPath));
-  const outputPath = path.join(dir, `${base}.${targetExt}`);
+  const outExt = targetExt || path.extname(inputPath).slice(1) || 'mp4';
+  const suffix = trimRequested ? '_clip' : '';
+  const outputPath = path.join(dir, `${base}${suffix}.${outExt}`);
 
-  if (onStart) onStart();
+  // Build ffmpeg args:
+  //   trim flags BEFORE -i = fast seek (keyframe accurate, near-instant)
+  //   when trimming with -c copy that's fine; when re-encoding it's also fine
+  //   for our purposes.
+  const trimArgs = [];
+  if (startSec !== null) trimArgs.push('-ss', String(startSec));
+  if (endSec !== null) trimArgs.push('-to', String(endSec));
+
+  // If converting, use the preset codec args. Otherwise stream-copy (fast).
+  const codecArgs = convertRequested
+    ? CONVERSION_PRESETS[targetExt].args
+    : ['-c', 'copy'];
 
   await new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
       '-y',
+      ...trimArgs,
       '-i', inputPath,
-      ...preset.args,
+      ...codecArgs,
       '-loglevel', 'error',
       outputPath,
     ]);
     ff.on('error', reject);
     ff.on('close', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg conversion exited with code ${code}`));
+      else reject(new Error(`ffmpeg post-process exited with code ${code}`));
     });
     if (isAborted && isAborted()) ff.kill('SIGKILL');
   });
 
-  // Remove the intermediate file
   try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch {}
-
   return outputPath;
 }
 
@@ -441,7 +498,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 // GET /download-progress -- SSE endpoint for download progress tracking
 // ---------------------------------------------------------------------------
 app.get('/download-progress', downloadLimiter, async (req, res) => {
-  const { url, itag, convertTo } = req.query;
+  const { url, itag, convertTo, start, end } = req.query;
 
   const urlError = validateUrl(url);
   if (urlError) {
@@ -457,6 +514,15 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
   if (convertError) {
     return res.status(400).json({ error: convertError });
   }
+
+  const trimError = validateTrim(start, end);
+  if (trimError) {
+    return res.status(400).json({ error: trimError });
+  }
+
+  const startSec = parseTime(start);
+  const endSec = parseTime(end);
+  const trimRequested = startSec !== null || endSec !== null;
 
   if (!ytdl.validateURL(url)) {
     return res.status(400).json({ error: 'Invalid URL' });
@@ -483,22 +549,26 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     }
   });
 
-  // Helper to run an optional conversion phase after a download/merge completes.
-  // Returns the final filename to serve (post-conversion if applicable).
-  const maybeConvert = async (filePath, currentExt) => {
-    if (!convertTo || convertTo === currentExt) {
+  // Helper to run optional trim + conversion phase after a download/merge.
+  // Returns the final filename to serve.
+  const maybeProcess = async (filePath, currentExt) => {
+    const needsConvert = convertTo && convertTo !== currentExt;
+    if (!needsConvert && !trimRequested) {
       return path.basename(filePath);
     }
+    const phase = needsConvert ? 'converting' : 'trimming';
     sendEvent({
       type: 'progress',
-      phase: 'converting',
+      phase,
       percent: 97,
       downloadedMB: '0',
       totalMB: '0',
     });
-    const finalPath = await convertFormat({
+    const finalPath = await processFile({
       inputPath: filePath,
-      targetExt: convertTo,
+      targetExt: needsConvert ? convertTo : null,
+      startSec,
+      endSec,
       isAborted: () => aborted,
     });
     return path.basename(finalPath);
@@ -558,7 +628,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
         });
 
         if (aborted) return;
-        const finalFilename = await maybeConvert(filePath, ext);
+        const finalFilename = await maybeProcess(filePath, ext);
         if (aborted) return;
         sendEvent({ type: 'complete', filename: finalFilename });
         res.end();
@@ -614,7 +684,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     fileStream.on('finish', async () => {
       if (aborted) return;
       try {
-        const finalFilename = await maybeConvert(filePath, ext);
+        const finalFilename = await maybeProcess(filePath, ext);
         if (aborted) return;
         sendEvent({ type: 'complete', filename: finalFilename });
         res.end();
