@@ -186,6 +186,83 @@ function parseTime(t) {
   return seconds >= 0 ? seconds : null;
 }
 
+// ---------------------------------------------------------------------------
+// Caption (subtitle) helpers -- parse YouTube timedtext XML and emit SRT/VTT.
+// ---------------------------------------------------------------------------
+function decodeHtmlEntities(s) {
+  return s
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+}
+
+function parseTimedTextXML(xml) {
+  const entries = [];
+  const regex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    const start = parseFloat(match[1]);
+    const dur = parseFloat(match[2]);
+    const text = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '')).trim();
+    if (text) entries.push({ start, end: start + dur, text });
+  }
+  return entries;
+}
+
+function pad(n, len = 2) {
+  return String(n).padStart(len, '0');
+}
+
+function formatTime(seconds, sep) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const ms = Math.round((seconds - Math.floor(seconds)) * 1000);
+  return `${pad(h)}:${pad(m)}:${pad(s)}${sep}${pad(ms, 3)}`;
+}
+
+function toSRT(entries) {
+  return entries
+    .map((e, i) => `${i + 1}\n${formatTime(e.start, ',')} --> ${formatTime(e.end, ',')}\n${e.text}\n`)
+    .join('\n');
+}
+
+function toVTT(entries) {
+  const lines = ['WEBVTT', ''];
+  for (const e of entries) {
+    lines.push(`${formatTime(e.start, '.')} --> ${formatTime(e.end, '.')}`);
+    lines.push(e.text);
+    lines.push('');
+  }
+  return lines.join('\n');
+}
+
+function extractCaptionTracks(info) {
+  const tracks = info.player_response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+  return tracks.map(t => ({
+    languageCode: t.languageCode,
+    name: t.name?.simpleText || t.name?.runs?.[0]?.text || t.languageCode,
+    isAuto: t.kind === 'asr',
+  }));
+}
+
+function validateCaptionFormat(format) {
+  if (format !== 'srt' && format !== 'vtt') {
+    return 'format must be "srt" or "vtt".';
+  }
+  return null;
+}
+
+function validateLangCode(lang) {
+  if (!lang || typeof lang !== 'string' || !/^[a-zA-Z0-9-]{1,15}$/.test(lang)) {
+    return 'lang must be a valid language code (e.g. "en", "es-419").';
+  }
+  return null;
+}
+
 function validateTrim(start, end) {
   const startProvided = start !== undefined && start !== '';
   const endProvided = end !== undefined && end !== '';
@@ -450,7 +527,8 @@ app.post('/info', infoLimiter, async (req, res) => {
     const responseData = {
       title: info.videoDetails.title,
       thumbnail: info.videoDetails.thumbnails?.[0]?.url || '',
-      formats: sortedFormats
+      formats: sortedFormats,
+      captions: extractCaptionTracks(info),
     };
 
     setCachedInfo(cleaned, responseData);
@@ -734,6 +812,58 @@ app.get('/download-file/:filename', (req, res) => {
 
   res.header('Content-Disposition', `attachment; filename="${filename}"`);
   res.sendFile(filePath);
+});
+
+// ---------------------------------------------------------------------------
+// GET /download-caption -- fetch a caption track and return as SRT or VTT
+// ---------------------------------------------------------------------------
+app.get('/download-caption', infoLimiter, async (req, res) => {
+  try {
+    const { url, lang, format } = req.query;
+
+    const urlError = validateUrl(url);
+    if (urlError) return res.status(400).json({ error: urlError });
+
+    const langError = validateLangCode(lang);
+    if (langError) return res.status(400).json({ error: langError });
+
+    const formatError = validateCaptionFormat(format);
+    if (formatError) return res.status(400).json({ error: formatError });
+
+    const cleaned = cleanUrl(url);
+    if (!ytdl.validateURL(cleaned)) {
+      return res.status(400).json({ error: 'Invalid YouTube URL' });
+    }
+
+    const info = await ytdl.getInfo(cleaned);
+    const tracks = info.player_response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
+    const track = tracks.find(t => t.languageCode === lang);
+
+    if (!track || !track.baseUrl) {
+      return res.status(404).json({ error: 'Caption track not found for that language.' });
+    }
+
+    const xmlRes = await fetch(track.baseUrl);
+    if (!xmlRes.ok) {
+      return res.status(502).json({ error: 'Failed to fetch caption data from YouTube.' });
+    }
+    const xml = await xmlRes.text();
+    const entries = parseTimedTextXML(xml);
+
+    if (entries.length === 0) {
+      return res.status(404).json({ error: 'Caption track is empty.' });
+    }
+
+    const body = format === 'srt' ? toSRT(entries) : toVTT(entries);
+    const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const filename = `${title}_${lang}.${format}`;
+
+    res.header('Content-Disposition', `attachment; filename="${filename}"`);
+    res.header('Content-Type', format === 'srt' ? 'application/x-subrip; charset=utf-8' : 'text/vtt; charset=utf-8');
+    res.send(body);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to download caption', details: err.message });
+  }
 });
 
 // ---------------------------------------------------------------------------

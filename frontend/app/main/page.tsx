@@ -10,7 +10,7 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
-import { Video, Search, Volume2, ScrollText } from 'lucide-react';
+import { Video, Search, Volume2, ScrollText, Captions } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface HistoryEntry {
@@ -30,6 +30,12 @@ interface VideoFormat {
   hasVideo: boolean;
   approxSizeMB: string;
   type: string;
+}
+
+interface CaptionTrack {
+  languageCode: string;
+  name: string;
+  isAuto: boolean;
 }
 
 interface ProgressState {
@@ -54,6 +60,7 @@ export default function Main() {
   const [convertTo, setConvertTo] = useState<string>('');
   const [trimStart, setTrimStart] = useState<string>('');
   const [trimEnd, setTrimEnd] = useState<string>('');
+  const [captions, setCaptions] = useState<CaptionTrack[]>([]);
   const router = useRouter();
 
   // Load history from localStorage on mount
@@ -89,6 +96,7 @@ export default function Main() {
       setFormats(uniqueFormats);
       setVideoTitle(res.data.title || '');
       setThumbnailUrl(res.data.thumbnail || '');
+      setCaptions(res.data.captions || []);
     } catch {
       toast.error('Failed to fetch video info');
     }
@@ -235,6 +243,62 @@ export default function Main() {
                         className="rounded object-cover"
                       />
                       <p className="font-bold text-sm leading-snug">{videoTitle}</p>
+                    </CardContent>
+                  </Card>
+                )}
+
+                {/* Subtitles card */}
+                {captions.length > 0 && (
+                  <Card className="mt-4">
+                    <CardContent className="p-3">
+                      <h5 className="font-medium mb-2">
+                        <Captions className="inline h-4 w-4 mr-1" /> Subtitles
+                      </h5>
+                      <div className="space-y-2 max-h-48 overflow-y-auto">
+                        {captions.map((c) => (
+                          <div
+                            key={c.languageCode}
+                            className="flex items-center justify-between gap-2 text-sm"
+                          >
+                            <span className="truncate">
+                              {c.name}
+                              {c.isAuto && (
+                                <span className="text-xs text-muted-foreground ml-1">(auto)</span>
+                              )}
+                            </span>
+                            <div className="flex gap-1 shrink-0">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => {
+                                  const params = new URLSearchParams({
+                                    url,
+                                    lang: c.languageCode,
+                                    format: 'srt',
+                                  });
+                                  window.open(`${BASE_URL}/download-caption?${params.toString()}`);
+                                }}
+                              >
+                                SRT
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => {
+                                  const params = new URLSearchParams({
+                                    url,
+                                    lang: c.languageCode,
+                                    format: 'vtt',
+                                  });
+                                  window.open(`${BASE_URL}/download-caption?${params.toString()}`);
+                                }}
+                              >
+                                VTT
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                     </CardContent>
                   </Card>
                 )}
