@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Image from 'next/image';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -74,7 +74,11 @@ export default function Main() {
   const [batchQuality, setBatchQuality] = useState<'best-video' | 'best-audio'>('best-video');
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
   const router = useRouter();
+
+  const isYouTubeUrl = (text: string) =>
+    /^https?:\/\/(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)/.test(text.trim());
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -87,6 +91,60 @@ export default function Main() {
       // ignore parse errors
     }
   }, []);
+
+  // Paste detection: auto-fill URL when pasting a YouTube URL outside inputs
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      const active = document.activeElement;
+      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+
+      const text = e.clipboardData?.getData('text')?.trim();
+      if (!text || !isYouTubeUrl(text)) return;
+
+      if (isBatch) {
+        setBatchUrls(prev => prev ? `${prev}\n${text}` : text);
+      } else {
+        setUrl(text);
+      }
+      toast.success('YouTube URL detected!');
+    };
+
+    document.addEventListener('paste', handlePaste);
+    return () => document.removeEventListener('paste', handlePaste);
+  }, [isBatch]);
+
+  // Drag-and-drop handlers
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    // Only hide overlay when leaving the card itself, not child elements
+    if (e.currentTarget.contains(e.relatedTarget as Node)) return;
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const text = e.dataTransfer.getData('text')?.trim();
+    if (!text) return;
+
+    // Support dropping multiple URLs (one per line)
+    const lines = text.split('\n').map(l => l.trim()).filter(l => isYouTubeUrl(l));
+    if (lines.length === 0) {
+      toast.error('No YouTube URL detected');
+      return;
+    }
+
+    if (isBatch) {
+      setBatchUrls(prev => prev ? `${prev}\n${lines.join('\n')}` : lines.join('\n'));
+    } else {
+      setUrl(lines[0]);
+    }
+    toast.success(`${lines.length} URL${lines.length > 1 ? 's' : ''} dropped!`);
+  }, [isBatch]);
 
   const saveToHistory = (entry: HistoryEntry) => {
     const updated = [entry, ...history];
@@ -313,7 +371,18 @@ export default function Main() {
     <>
       <Navbar />
       <div className="min-h-screen p-6">
-        <Card className="max-w-xl mx-auto p-4 space-y-4">
+        <Card
+          className="max-w-xl mx-auto p-4 space-y-4 relative"
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {/* Drop zone overlay */}
+          {isDragging && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-primary/10 border-2 border-dashed border-primary pointer-events-none">
+              <p className="text-primary font-semibold text-lg">Drop YouTube URL here</p>
+            </div>
+          )}
           <CardContent>
             <h2 className="text-2xl font-bold mb-8 text-center">
               <Video className="inline h-6 w-6 mr-1" /> YouTube Video Downloader
