@@ -66,6 +66,10 @@ export default function Main() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [videoTitle, setVideoTitle] = useState<string>('');
   const [thumbnailUrl, setThumbnailUrl] = useState<string>('');
+  const [channel, setChannel] = useState<string>('');
+  const [duration, setDuration] = useState<number>(0);
+  const [viewCount, setViewCount] = useState<string>('');
+  const [uploadDate, setUploadDate] = useState<string>('');
   const [progress, setProgress] = useState<ProgressState | null>(null);
   const [convertTo, setConvertTo] = useState<string>('');
   const [trimStart, setTrimStart] = useState<string>('');
@@ -87,6 +91,24 @@ export default function Main() {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return m < 60 ? `${m}m ${s}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+  };
+
+  const formatDuration = (totalSec: number) => {
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    return h > 0
+      ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+      : `${m}:${String(s).padStart(2, '0')}`;
+  };
+
+  const formatViews = (count: string) => {
+    const n = parseInt(count, 10);
+    if (isNaN(n)) return count;
+    if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return n.toLocaleString();
   };
 
   // Load history from localStorage on mount
@@ -203,6 +225,10 @@ export default function Main() {
       setFormats(uniqueFormats);
       setVideoTitle(res.data.title || '');
       setThumbnailUrl(res.data.thumbnail || '');
+      setChannel(res.data.channel || '');
+      setDuration(res.data.duration || 0);
+      setViewCount(res.data.viewCount || '0');
+      setUploadDate(res.data.uploadDate || '');
       setCaptions(res.data.captions || []);
     } catch {
       toast.error('Failed to fetch video info');
@@ -578,6 +604,12 @@ export default function Main() {
                       />
                       <div className="flex-1 min-w-0">
                         <p className="font-bold text-sm leading-snug">{videoTitle}</p>
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-xs text-muted-foreground">
+                          {channel && <span>{channel}</span>}
+                          {duration > 0 && <span>{formatDuration(duration)}</span>}
+                          {viewCount && viewCount !== '0' && <span>{formatViews(viewCount)} views</span>}
+                          {uploadDate && <span>{new Date(uploadDate).toLocaleDateString()}</span>}
+                        </div>
                         <div className="flex items-center gap-1 mt-2 flex-wrap">
                           <ImageDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
                           {(['maxres', 'hq', 'sd'] as const).map((q) => (

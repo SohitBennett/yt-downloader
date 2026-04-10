@@ -536,6 +536,10 @@ app.post('/info', infoLimiter, async (req, res) => {
       title: info.videoDetails.title,
       thumbnail: thumbnails[0]?.url || '',
       thumbnails,
+      channel: info.videoDetails.author?.name || '',
+      duration: Number(info.videoDetails.lengthSeconds) || 0,
+      viewCount: info.videoDetails.viewCount || '0',
+      uploadDate: info.videoDetails.uploadDate || info.videoDetails.publishDate || '',
       formats: sortedFormats,
       captions: extractCaptionTracks(info),
     };
