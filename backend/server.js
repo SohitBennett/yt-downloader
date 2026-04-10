@@ -75,6 +75,10 @@ app.use(globalLimiter);
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
+// Tracks file paths that are currently being downloaded so we don't serve
+// incomplete files as "already done" on a resume attempt.
+const activeDownloads = new Set();
+
 // ---------------------------------------------------------------------------
 // In-memory cache for video info (TTL = 10 min, max 100 entries)
 // ---------------------------------------------------------------------------
@@ -363,6 +367,7 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
   let videoBytes = 0;
   let audioBytes = 0;
   let throttleLast = 0;
+  const downloadStartTime = Date.now();
 
   const reportDownloadProgress = () => {
     const now = Date.now();
@@ -371,11 +376,15 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
     const downloaded = videoBytes + audioBytes;
     const downloadedMB = (downloaded / (1024 * 1024)).toFixed(2);
     const totalMB = totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown';
-    // Cap download phase at 95% so the merge phase has the last 5%.
     const percent = totalSize
       ? Number(Math.min((downloaded / totalSize) * 95, 95).toFixed(1))
       : null;
-    onProgress({ phase: 'downloading', percent, downloadedMB, totalMB });
+    const elapsedSec = (now - downloadStartTime) / 1000;
+    const speedBps = elapsedSec > 0 ? downloaded / elapsedSec : 0;
+    const speedMBs = (speedBps / (1024 * 1024)).toFixed(2);
+    const remainingBytes = totalSize - downloaded;
+    const etaSec = speedBps > 0 && totalSize ? Math.ceil(remainingBytes / speedBps) : null;
+    onProgress({ phase: 'downloading', percent, downloadedMB, totalMB, speedMBs, etaSec });
   };
 
   const cleanupTemps = () => {
@@ -387,10 +396,6 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
     const stream = ytdl(url, { format });
     const file = fs.createWriteStream(dest);
     stream.on('data', (chunk) => {
-      if (isAborted()) {
-        stream.destroy();
-        return;
-      }
       onByte(chunk.length);
     });
     stream.on('error', reject);
@@ -409,18 +414,16 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
     throw err;
   }
 
-  if (isAborted()) {
-    cleanupTemps();
-    return;
+  // Merge phase — continue even if client disconnected so the file is ready
+  // for a resume attempt.
+  if (!isAborted()) {
+    onProgress({
+      phase: 'merging',
+      percent: 95,
+      downloadedMB: ((videoBytes + audioBytes) / (1024 * 1024)).toFixed(2),
+      totalMB: totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown',
+    });
   }
-
-  // Merge phase
-  onProgress({
-    phase: 'merging',
-    percent: 95,
-    downloadedMB: ((videoBytes + audioBytes) / (1024 * 1024)).toFixed(2),
-    totalMB: totalSize ? (totalSize / (1024 * 1024)).toFixed(2) : 'unknown',
-  });
 
   await new Promise((resolve, reject) => {
     const ff = spawn(ffmpegPath, [
@@ -436,7 +439,6 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited with code ${code}`));
     });
-    if (isAborted()) ff.kill('SIGKILL');
   });
 
   cleanupTemps();
@@ -620,11 +622,10 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
   let aborted = false;
   let stream = null;
 
+  // On disconnect: stop sending SSE events but let the download finish to disk
+  // so the file is ready if the user retries.
   req.on('close', () => {
     aborted = true;
-    if (stream) {
-      stream.destroy();
-    }
   });
 
   // Helper to run optional trim + conversion phase after a download/merge.
@@ -679,6 +680,24 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     const isVideoOnly = format.hasVideo && !format.hasAudio;
 
     // -----------------------------------------------------------------------
+    // Instant resume: if the final file already exists on disk and is not
+    // currently being downloaded, skip re-download and serve it immediately.
+    // -----------------------------------------------------------------------
+    const baseExt = format.container || 'mp4';
+    const baseName = isVideoOnly
+      ? `${title}_${itag}_merged`
+      : `${title}_${format.itag}`;
+    const finalExt = convertTo || baseExt;
+    const trimSuffix = (startSec !== null || endSec !== null) ? '_clip' : '';
+    const expectedFilename = `${baseName}${trimSuffix}.${finalExt}`;
+    const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
+
+    if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
+      sendEvent({ type: 'complete', filename: expectedFilename });
+      return res.end();
+    }
+
+    // -----------------------------------------------------------------------
     // Branch 1: video-only format -> download + audio + ffmpeg merge
     // -----------------------------------------------------------------------
     if (isVideoOnly) {
@@ -692,6 +711,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
       const mergedFilename = `${title}_${itag}_merged.${ext}`;
       const filePath = path.join(DOWNLOAD_DIR, mergedFilename);
 
+      activeDownloads.add(expectedPath);
       try {
         await downloadAndMerge({
           url,
@@ -705,12 +725,14 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
           },
         });
 
+        activeDownloads.delete(expectedPath);
         if (aborted) return;
         const finalFilename = await maybeProcess(filePath, ext);
         if (aborted) return;
         sendEvent({ type: 'complete', filename: finalFilename });
         res.end();
       } catch (err) {
+        activeDownloads.delete(expectedPath);
         if (!aborted) {
           sendEvent({ type: 'error', message: err.message });
           res.end();
@@ -727,12 +749,14 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     const filename = `${title}_${format.itag}.${ext}`;
     const filePath = path.join(DOWNLOAD_DIR, filename);
 
+    activeDownloads.add(expectedPath);
     stream = ytdl(url, { format });
     const fileStream = fs.createWriteStream(filePath);
 
     let downloadedBytes = 0;
     let lastSent = 0;
     const THROTTLE_MS = 500;
+    const singleStartTime = Date.now();
 
     stream.on('data', (chunk) => {
       if (aborted) return;
@@ -745,21 +769,26 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
         const totalMB = contentLength
           ? (contentLength / (1024 * 1024)).toFixed(2)
           : 'unknown';
-        // Cap at 95% if we'll convert afterwards
         const rawPercent = contentLength
           ? Math.min((downloadedBytes / contentLength) * 100, 100)
           : null;
         const percent = rawPercent !== null
           ? Number((convertTo ? Math.min(rawPercent * 0.95, 95) : rawPercent).toFixed(1))
           : null;
+        const elapsedSec = (now - singleStartTime) / 1000;
+        const speedBps = elapsedSec > 0 ? downloadedBytes / elapsedSec : 0;
+        const speedMBs = (speedBps / (1024 * 1024)).toFixed(2);
+        const remainingBytes = contentLength - downloadedBytes;
+        const etaSec = speedBps > 0 && contentLength ? Math.ceil(remainingBytes / speedBps) : null;
 
-        sendEvent({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB });
+        sendEvent({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB, speedMBs, etaSec });
       }
     });
 
     stream.pipe(fileStream);
 
     fileStream.on('finish', async () => {
+      activeDownloads.delete(expectedPath);
       if (aborted) return;
       try {
         const finalFilename = await maybeProcess(filePath, ext);
@@ -775,6 +804,7 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     });
 
     stream.on('error', (err) => {
+      activeDownloads.delete(expectedPath);
       if (aborted) return;
       sendEvent({ type: 'error', message: err.message });
       res.end();
@@ -794,7 +824,8 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /download-file/:filename -- serve a downloaded file from DOWNLOAD_DIR
+// GET /download-file/:filename -- serve a downloaded file with Range support
+// so browsers can resume interrupted downloads (HTTP 206 Partial Content).
 // ---------------------------------------------------------------------------
 app.get('/download-file/:filename', (req, res) => {
   const { filename } = req.params;
@@ -810,8 +841,35 @@ app.get('/download-file/:filename', (req, res) => {
     return res.status(404).json({ error: 'File not found.' });
   }
 
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+
   res.header('Content-Disposition', `attachment; filename="${filename}"`);
-  res.sendFile(filePath);
+  res.header('Accept-Ranges', 'bytes');
+
+  const rangeHeader = req.headers.range;
+  if (rangeHeader) {
+    const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+    if (!match) {
+      res.status(416).header('Content-Range', `bytes */${fileSize}`).end();
+      return;
+    }
+    const start = parseInt(match[1], 10);
+    const end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+
+    if (start >= fileSize || end >= fileSize || start > end) {
+      res.status(416).header('Content-Range', `bytes */${fileSize}`).end();
+      return;
+    }
+
+    res.status(206);
+    res.header('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+    res.header('Content-Length', String(end - start + 1));
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.header('Content-Length', String(fileSize));
+    fs.createReadStream(filePath).pipe(res);
+  }
 });
 
 // ---------------------------------------------------------------------------
