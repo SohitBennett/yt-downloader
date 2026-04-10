@@ -51,6 +51,8 @@ interface ProgressState {
   downloadedMB: string;
   totalMB: string;
   phase: 'downloading' | 'merging' | 'converting' | 'trimming' | 'complete';
+  speedMBs?: string;
+  etaSec?: number | null;
 }
 
 export default function Main() {
@@ -79,6 +81,13 @@ export default function Main() {
 
   const isYouTubeUrl = (text: string) =>
     /^https?:\/\/(www\.)?(youtube\.com|youtu\.be|m\.youtube\.com)/.test(text.trim());
+
+  const formatEta = (seconds: number) => {
+    if (seconds < 60) return `${seconds}s`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return m < 60 ? `${m}m ${s}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+  };
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -237,6 +246,8 @@ export default function Main() {
             downloadedMB: data.downloadedMB || '0',
             totalMB: data.totalMB || '0',
             phase: data.phase || 'downloading',
+            speedMBs: data.speedMBs || undefined,
+            etaSec: data.etaSec ?? null,
           });
         } else if (data.type === 'complete') {
           completed = true;
@@ -777,7 +788,15 @@ export default function Main() {
                               ? 'Trimming clip…'
                               : `${progress.percent}%`}
                       </span>
-                      <span>{progress.downloadedMB} / {progress.totalMB} MB</span>
+                      <span className="text-muted-foreground">
+                        {progress.downloadedMB} / {progress.totalMB} MB
+                        {progress.speedMBs && progress.phase === 'downloading' && (
+                          <> &middot; {progress.speedMBs} MB/s</>
+                        )}
+                        {progress.etaSec != null && progress.etaSec > 0 && progress.phase === 'downloading' && (
+                          <> &middot; {formatEta(progress.etaSec)}</>
+                        )}
+                      </span>
                     </div>
                     <div className="w-full bg-muted rounded h-2 overflow-hidden">
                       <div
