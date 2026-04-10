@@ -526,9 +526,16 @@ app.post('/info', infoLimiter, async (req, res) => {
       return bRes - aRes;
     });
 
+    const thumbnails = (info.videoDetails.thumbnails || []).map(t => ({
+      url: t.url,
+      width: t.width,
+      height: t.height,
+    }));
+
     const responseData = {
       title: info.videoDetails.title,
-      thumbnail: info.videoDetails.thumbnails?.[0]?.url || '',
+      thumbnail: thumbnails[0]?.url || '',
+      thumbnails,
       formats: sortedFormats,
       captions: extractCaptionTracks(info),
     };
@@ -921,6 +928,53 @@ app.get('/download-caption', infoLimiter, async (req, res) => {
     res.send(body);
   } catch (err) {
     res.status(500).json({ error: 'Failed to download caption', details: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /download-thumbnail -- proxy a YouTube thumbnail and serve as download
+// ---------------------------------------------------------------------------
+const THUMBNAIL_QUALITIES = {
+  maxres: 'maxresdefault',
+  sd:     'sddefault',
+  hq:     'hqdefault',
+  mq:     'mqdefault',
+  default: 'default',
+};
+
+app.get('/download-thumbnail', infoLimiter, async (req, res) => {
+  try {
+    const { url, quality } = req.query;
+
+    const urlError = validateUrl(url);
+    if (urlError) return res.status(400).json({ error: urlError });
+
+    const q = quality || 'maxres';
+    if (!THUMBNAIL_QUALITIES[q]) {
+      return res.status(400).json({ error: `quality must be one of: ${Object.keys(THUMBNAIL_QUALITIES).join(', ')}` });
+    }
+
+    const cleaned = cleanUrl(url);
+    if (!ytdl.validateURL(cleaned)) {
+      return res.status(400).json({ error: 'Invalid YouTube URL' });
+    }
+
+    const videoId = ytdl.getVideoID(cleaned);
+    const thumbUrl = `https://img.youtube.com/vi/${videoId}/${THUMBNAIL_QUALITIES[q]}.jpg`;
+
+    const thumbRes = await fetch(thumbUrl);
+    if (!thumbRes.ok) {
+      return res.status(404).json({ error: 'Thumbnail not available at this quality.' });
+    }
+
+    const filename = `${videoId}_${q}.jpg`;
+    res.header('Content-Disposition', `attachment; filename="${filename}"`);
+    res.header('Content-Type', 'image/jpeg');
+
+    const arrayBuffer = await thumbRes.arrayBuffer();
+    res.send(Buffer.from(arrayBuffer));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to download thumbnail', details: err.message });
   }
 });
 

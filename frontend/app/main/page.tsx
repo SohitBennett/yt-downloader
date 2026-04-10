@@ -10,7 +10,7 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
-import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock } from 'lucide-react';
+import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock, ImageDown } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface HistoryEntry {
@@ -576,7 +576,26 @@ export default function Main() {
                         unoptimized
                         className="rounded object-cover"
                       />
-                      <p className="font-bold text-sm leading-snug">{videoTitle}</p>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-bold text-sm leading-snug">{videoTitle}</p>
+                        <div className="flex items-center gap-1 mt-2 flex-wrap">
+                          <ImageDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                          {(['maxres', 'hq', 'sd'] as const).map((q) => (
+                            <Button
+                              key={q}
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[11px]"
+                              onClick={() => {
+                                const params = new URLSearchParams({ url, quality: q });
+                                window.open(`${BASE_URL}/download-thumbnail?${params.toString()}`);
+                              }}
+                            >
+                              {q === 'maxres' ? 'HD' : q === 'hq' ? 'MQ' : 'SD'}
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
                     </CardContent>
                   </Card>
                 )}
