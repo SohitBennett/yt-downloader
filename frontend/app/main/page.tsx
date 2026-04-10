@@ -10,7 +10,7 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
-import { Video, Search, Volume2, ScrollText, Captions } from 'lucide-react';
+import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock } from 'lucide-react';
 import { toast } from 'sonner';
 
 interface HistoryEntry {
@@ -38,6 +38,14 @@ interface CaptionTrack {
   isAuto: boolean;
 }
 
+interface BatchItem {
+  url: string;
+  title: string;
+  status: 'pending' | 'fetching' | 'downloading' | 'complete' | 'error';
+  progress: number;
+  error?: string;
+}
+
 interface ProgressState {
   percent: number;
   downloadedMB: string;
@@ -61,6 +69,11 @@ export default function Main() {
   const [trimStart, setTrimStart] = useState<string>('');
   const [trimEnd, setTrimEnd] = useState<string>('');
   const [captions, setCaptions] = useState<CaptionTrack[]>([]);
+  const [isBatch, setIsBatch] = useState(false);
+  const [batchUrls, setBatchUrls] = useState('');
+  const [batchQuality, setBatchQuality] = useState<'best-video' | 'best-audio'>('best-video');
+  const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
+  const [batchRunning, setBatchRunning] = useState(false);
   const router = useRouter();
 
   // Load history from localStorage on mount
@@ -170,6 +183,109 @@ export default function Main() {
     };
   };
 
+  const updateBatchItem = (index: number, updates: Partial<BatchItem>) => {
+    setBatchQueue(prev => prev.map((item, i) => i === index ? { ...item, ...updates } : item));
+  };
+
+  const pickBestFormat = (formats: VideoFormat[]) => {
+    if (batchQuality === 'best-audio') {
+      return formats
+        .filter(f => f.type === 'audio only' && f.approxSizeMB !== 'N/A')
+        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+    }
+    // best-video: prefer highest-res video-only (auto-merge), fallback to pre-muxed
+    return (
+      formats
+        .filter(f => f.type === 'video only' && f.approxSizeMB !== 'N/A')
+        .sort((a, b) => (parseInt(b.qualityLabel) || 0) - (parseInt(a.qualityLabel) || 0))[0]
+      || formats
+        .filter(f => f.type === 'video+audio' && f.approxSizeMB !== 'N/A')
+        .sort((a, b) => (parseInt(b.qualityLabel) || 0) - (parseInt(a.qualityLabel) || 0))[0]
+    );
+  };
+
+  const startBatch = async () => {
+    const urls = batchUrls.split('\n').map(u => u.trim()).filter(u => u.length > 0);
+    if (urls.length === 0) {
+      toast.warning('Paste at least one URL');
+      return;
+    }
+
+    const initialQueue: BatchItem[] = urls.map(u => ({
+      url: u, title: u, status: 'pending', progress: 0,
+    }));
+    setBatchQueue(initialQueue);
+    setBatchRunning(true);
+
+    for (let i = 0; i < urls.length; i++) {
+      updateBatchItem(i, { status: 'fetching' });
+
+      try {
+        // Fetch info
+        const res = await axios.post(`${BASE_URL}/info`, { url: urls[i] });
+        const title = res.data.title || urls[i];
+        updateBatchItem(i, { title });
+
+        // Auto-pick best format
+        const bestFormat = pickBestFormat(res.data.formats || []);
+        if (!bestFormat) {
+          updateBatchItem(i, { status: 'error', error: 'No suitable format found' });
+          continue;
+        }
+
+        // Start SSE download
+        updateBatchItem(i, { status: 'downloading' });
+
+        await new Promise<void>((resolve) => {
+          const params = new URLSearchParams({ url: urls[i], itag: String(bestFormat.itag) });
+          if (convertTo) params.set('convertTo', convertTo);
+          if (trimStart) params.set('start', trimStart);
+          if (trimEnd) params.set('end', trimEnd);
+
+          const eventSource = new EventSource(`${BASE_URL}/download-progress?${params.toString()}`);
+          let done = false;
+
+          eventSource.onmessage = (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              if (data.type === 'progress') {
+                updateBatchItem(i, { progress: data.percent ?? 0 });
+              } else if (data.type === 'complete') {
+                done = true;
+                updateBatchItem(i, { status: 'complete', progress: 100 });
+                if (data.filename) {
+                  window.open(`${BASE_URL}/download-file/${data.filename}`);
+                }
+                eventSource.close();
+                resolve();
+              } else if (data.type === 'error') {
+                done = true;
+                updateBatchItem(i, { status: 'error', error: data.message });
+                eventSource.close();
+                resolve();
+              }
+            } catch { /* ignore */ }
+          };
+
+          eventSource.onerror = () => {
+            if (done) return;
+            updateBatchItem(i, { status: 'error', error: 'Connection failed' });
+            eventSource.close();
+            resolve();
+          };
+        });
+
+        // Save to history
+        saveToHistory({ title, url: urls[i], type: 'single', timestamp: Date.now() });
+      } catch {
+        updateBatchItem(i, { status: 'error', error: 'Failed to fetch video info' });
+      }
+    }
+
+    setBatchRunning(false);
+    toast.success('Batch complete!');
+  };
+
   const handlePlaylist = async () => {
     setLoading(true);
     try {
@@ -202,30 +318,139 @@ export default function Main() {
             <h2 className="text-2xl font-bold mb-8 text-center">
               <Video className="inline h-6 w-6 mr-1" /> YouTube Video Downloader
             </h2>
-            <Input
-              placeholder="Paste YouTube video or playlist URL"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-            />
-            <div className="flex items-center justify-between py-2">
-              <span>Download whole Playlist?</span>
-              <Switch checked={isPlaylist} onCheckedChange={setIsPlaylist} />
+            {/* Mode toggles */}
+            <div className="flex items-center justify-between py-2 gap-4">
+              <div className="flex items-center gap-2">
+                <span className="text-sm">Playlist</span>
+                <Switch checked={isPlaylist} onCheckedChange={(v) => { setIsPlaylist(v); if (v) setIsBatch(false); }} />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm">Batch</span>
+                <Switch checked={isBatch} onCheckedChange={(v) => { setIsBatch(v); if (v) setIsPlaylist(false); }} />
+              </div>
             </div>
 
-            {isPlaylist ? (
-              <div className="flex gap-4 mt-4">
-                <Button onClick={() => setType('video')} variant={type === 'video' ? 'default' : 'outline'}>
-                  Video
+            {/* ---------- Batch mode ---------- */}
+            {isBatch ? (
+              <div className="space-y-4">
+                <textarea
+                  placeholder={"Paste YouTube URLs, one per line:\nhttps://youtube.com/watch?v=...\nhttps://youtube.com/watch?v=..."}
+                  value={batchUrls}
+                  onChange={(e) => setBatchUrls(e.target.value)}
+                  rows={5}
+                  className="w-full rounded-md border border-input bg-card text-foreground px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring resize-y"
+                />
+
+                <div className="flex items-center gap-3">
+                  <label className="text-sm font-medium">Quality:</label>
+                  <select
+                    value={batchQuality}
+                    onChange={(e) => setBatchQuality(e.target.value as 'best-video' | 'best-audio')}
+                    className="flex-1 h-9 rounded-md border border-input bg-card text-foreground px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="best-video">Best Video (auto-merge)</option>
+                    <option value="best-audio">Best Audio</option>
+                  </select>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <label className="text-sm font-medium">Convert to:</label>
+                  <select
+                    value={convertTo}
+                    onChange={(e) => setConvertTo(e.target.value)}
+                    className="flex-1 h-9 rounded-md border border-input bg-card text-foreground px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  >
+                    <option value="">Original (no conversion)</option>
+                    <optgroup label="Audio">
+                      <option value="mp3">MP3</option>
+                      <option value="m4a">M4A</option>
+                      <option value="wav">WAV</option>
+                      <option value="ogg">OGG</option>
+                      <option value="flac">FLAC</option>
+                    </optgroup>
+                    <optgroup label="Video">
+                      <option value="mp4">MP4</option>
+                      <option value="webm">WebM</option>
+                      <option value="mkv">MKV (remux)</option>
+                    </optgroup>
+                  </select>
+                </div>
+
+                <Button
+                  onClick={startBatch}
+                  disabled={batchRunning}
+                  className="w-full"
+                >
+                  {batchRunning ? (
+                    <><Loader2 className="h-4 w-4 mr-1 animate-spin" /> Processing…</>
+                  ) : (
+                    'Start Batch Download'
+                  )}
                 </Button>
-                <Button onClick={() => setType('audio')} variant={type === 'audio' ? 'default' : 'outline'}>
-                  Audio
-                </Button>
-                <Button disabled={loading} onClick={handlePlaylist}>
-                  {loading ? 'Downloading...' : 'Download Playlist'}
-                </Button>
+
+                {/* Queue list */}
+                {batchQueue.length > 0 && (
+                  <div className="space-y-2 mt-2">
+                    {batchQueue.map((item, i) => (
+                      <div key={i} className="flex items-center gap-2 text-sm border rounded-md p-2">
+                        {item.status === 'complete' && <CheckCircle2 className="h-4 w-4 text-green-600 shrink-0" />}
+                        {item.status === 'error' && <XCircle className="h-4 w-4 text-red-500 shrink-0" />}
+                        {item.status === 'downloading' && <Loader2 className="h-4 w-4 animate-spin text-primary shrink-0" />}
+                        {item.status === 'fetching' && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground shrink-0" />}
+                        {item.status === 'pending' && <Clock className="h-4 w-4 text-muted-foreground shrink-0" />}
+
+                        <div className="flex-1 min-w-0">
+                          <p className="truncate font-medium">{item.title}</p>
+                          {item.status === 'downloading' && (
+                            <div className="w-full bg-muted rounded h-1.5 mt-1 overflow-hidden">
+                              <div
+                                className="bg-primary h-1.5 rounded transition-all duration-300"
+                                style={{ width: `${item.progress}%` }}
+                              />
+                            </div>
+                          )}
+                          {item.status === 'error' && (
+                            <p className="text-xs text-red-500 truncate">{item.error}</p>
+                          )}
+                        </div>
+
+                        <span className="text-xs text-muted-foreground shrink-0">
+                          {item.status === 'downloading' ? `${item.progress}%` : item.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+            ) : isPlaylist ? (
+              /* ---------- Playlist mode ---------- */
+              <div>
+                <Input
+                  placeholder="Paste YouTube playlist URL"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                />
+                <div className="flex gap-4 mt-4">
+                  <Button onClick={() => setType('video')} variant={type === 'video' ? 'default' : 'outline'}>
+                    Video
+                  </Button>
+                  <Button onClick={() => setType('audio')} variant={type === 'audio' ? 'default' : 'outline'}>
+                    Audio
+                  </Button>
+                  <Button disabled={loading} onClick={handlePlaylist}>
+                    {loading ? 'Downloading...' : 'Download Playlist'}
+                  </Button>
+                </div>
               </div>
             ) : (
+              /* ---------- Single video mode ---------- */
               <>
+                <Input
+                  placeholder="Paste YouTube video URL"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                />
                 <Button onClick={fetchInfo} disabled={loading} className="mt-4">
                   {loading ? 'Loading formats...' : <><Search className="inline h-4 w-4 mr-1" /> Formats</>}
                 </Button>
