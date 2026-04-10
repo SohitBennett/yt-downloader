@@ -113,6 +113,33 @@ export default function Main() {
     return () => document.removeEventListener('paste', handlePaste);
   }, [isBatch]);
 
+  // Global keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      const inInput = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+
+      // Ctrl+Enter / Cmd+Enter → start download or batch
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+        e.preventDefault();
+        if (isBatch && !batchRunning) {
+          document.getElementById('batch-start-btn')?.click();
+        } else if (!isBatch && !isPlaylist && selectedItag && !downloadLoading) {
+          document.getElementById('download-btn')?.click();
+        }
+        return;
+      }
+
+      // Escape → clear format selection
+      if (e.key === 'Escape' && !inInput) {
+        setSelectedItag('');
+      }
+    };
+
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isBatch, isPlaylist, selectedItag, downloadLoading, batchRunning]);
+
   // Drag-and-drop handlers
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -446,6 +473,7 @@ export default function Main() {
                 </div>
 
                 <Button
+                  id="batch-start-btn"
                   onClick={startBatch}
                   disabled={batchRunning}
                   className="w-full"
@@ -453,7 +481,7 @@ export default function Main() {
                   {batchRunning ? (
                     <><Loader2 className="h-4 w-4 mr-1 animate-spin" /> Processing…</>
                   ) : (
-                    'Start Batch Download'
+                    <>Start Batch Download <kbd className="ml-2 text-[10px] bg-primary-foreground/20 px-1.5 py-0.5 rounded font-mono">Ctrl+Enter</kbd></>
                   )}
                 </Button>
 
@@ -519,9 +547,10 @@ export default function Main() {
                   placeholder="Paste YouTube video URL"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && url && !loading) fetchInfo(); }}
                 />
                 <Button onClick={fetchInfo} disabled={loading} className="mt-4">
-                  {loading ? 'Loading formats...' : <><Search className="inline h-4 w-4 mr-1" /> Formats</>}
+                  {loading ? 'Loading formats...' : <><Search className="inline h-4 w-4 mr-1" /> Formats <kbd className="ml-2 text-[10px] bg-muted px-1.5 py-0.5 rounded font-mono">Enter</kbd></>}
                 </Button>
 
                 {/* Video preview card */}
@@ -760,6 +789,7 @@ export default function Main() {
                 )}
 
                 <Button
+                  id="download-btn"
                   disabled={!selectedItag || downloadLoading}
                   onClick={handleDownload}
                   className="mt-4 w-full flex items-center justify-center gap-2"
@@ -789,7 +819,7 @@ export default function Main() {
                       Downloading...
                     </>
                   ) : (
-                    'Download'
+                    <>Download <kbd className="ml-2 text-[10px] bg-primary-foreground/20 px-1.5 py-0.5 rounded font-mono">Ctrl+Enter</kbd></>
                   )}
                 </Button>
               </>
