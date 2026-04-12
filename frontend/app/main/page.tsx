@@ -10,8 +10,14 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
-import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock, ImageDown } from 'lucide-react';
+import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock, ImageDown, History } from 'lucide-react';
 import { toast } from 'sonner';
+
+interface RecentSearch {
+  url: string;
+  title: string;
+  timestamp: number;
+}
 
 interface HistoryEntry {
   title: string;
@@ -81,6 +87,7 @@ export default function Main() {
   const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
   const router = useRouter();
 
   const isYouTubeUrl = (text: string) =>
@@ -111,16 +118,16 @@ export default function Main() {
     return n.toLocaleString();
   };
 
-  // Load history from localStorage on mount
+  // Load history and recent searches from localStorage on mount
   useEffect(() => {
     try {
       const stored = localStorage.getItem('downloads');
-      if (stored) {
-        setHistory(JSON.parse(stored));
-      }
-    } catch {
-      // ignore parse errors
-    }
+      if (stored) setHistory(JSON.parse(stored));
+    } catch { /* ignore */ }
+    try {
+      const stored = localStorage.getItem('recentSearches');
+      if (stored) setRecentSearches(JSON.parse(stored));
+    } catch { /* ignore */ }
   }, []);
 
   // Paste detection: auto-fill URL when pasting a YouTube URL outside inputs
@@ -204,6 +211,15 @@ export default function Main() {
     toast.success(`${lines.length} URL${lines.length > 1 ? 's' : ''} dropped!`);
   }, [isBatch]);
 
+  const saveRecentSearch = (searchUrl: string, title: string) => {
+    setRecentSearches(prev => {
+      const filtered = prev.filter(s => s.url !== searchUrl);
+      const updated = [{ url: searchUrl, title, timestamp: Date.now() }, ...filtered].slice(0, 10);
+      localStorage.setItem('recentSearches', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
   const saveToHistory = (entry: HistoryEntry) => {
     const updated = [entry, ...history];
     setHistory(updated);
@@ -230,6 +246,7 @@ export default function Main() {
       setViewCount(res.data.viewCount || '0');
       setUploadDate(res.data.uploadDate || '');
       setCaptions(res.data.captions || []);
+      saveRecentSearch(url, res.data.title || url);
     } catch {
       toast.error('Failed to fetch video info');
     }
@@ -586,6 +603,25 @@ export default function Main() {
                   onChange={(e) => setUrl(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter' && url && !loading) fetchInfo(); }}
                 />
+
+                {/* Recent searches */}
+                {recentSearches.length > 0 && !url && (
+                  <div className="mt-2 space-y-1">
+                    <p className="text-xs text-muted-foreground flex items-center gap-1">
+                      <History className="h-3 w-3" /> Recent
+                    </p>
+                    {recentSearches.slice(0, 5).map((s) => (
+                      <button
+                        key={s.url}
+                        onClick={() => setUrl(s.url)}
+                        className="block w-full text-left text-xs px-2 py-1.5 rounded-md hover:bg-accent truncate text-foreground/80"
+                      >
+                        {s.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
                 <Button onClick={fetchInfo} disabled={loading} className="mt-4">
                   {loading ? 'Loading formats...' : <><Search className="inline h-4 w-4 mr-1" /> Formats <kbd className="ml-2 text-[10px] bg-muted px-1.5 py-0.5 rounded font-mono">Enter</kbd></>}
                 </Button>
