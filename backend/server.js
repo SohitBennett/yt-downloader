@@ -8,6 +8,7 @@ const path = require('path');
 const cron = require('node-cron');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
+const { Queue, Worker, QueueEvents } = require('bullmq');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -586,30 +587,194 @@ app.get('/download', downloadLimiter, async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /download-progress -- SSE endpoint for download progress tracking
+// Download pipeline -- self-contained function used by both the BullMQ worker
+// and (as fallback) direct SSE execution. Reports progress via onProgress().
+// Returns { filename } on success or throws on error.
+// ---------------------------------------------------------------------------
+async function executeDownload({ url, itag, convertTo, startSec, endSec, trimRequested, onProgress }) {
+  const info = await ytdl.getInfo(url);
+  const requestedFormat = info.formats.find(f => String(f.itag) === String(itag));
+  if (!requestedFormat) throw new Error('Format not found for the given itag');
+
+  const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+  const targetIsAudio = convertTo && CONVERSION_PRESETS[convertTo]?.kind === 'audio';
+
+  // Smart routing: audio target + video itag → swap to best audio-only
+  let format = requestedFormat;
+  if (targetIsAudio && requestedFormat.hasVideo) {
+    const audioOnly = info.formats.filter(f => f.hasAudio && !f.hasVideo);
+    if (audioOnly.length > 0) {
+      format = audioOnly.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+    }
+  }
+
+  const isVideoOnly = format.hasVideo && !format.hasAudio;
+  const baseExt = format.container || 'mp4';
+  const needsConvert = convertTo && convertTo !== baseExt;
+
+  // Post-process helper (trim + convert in one pass)
+  const maybeProcess = async (filePath, currentExt) => {
+    if (!needsConvert && !trimRequested) return path.basename(filePath);
+    const phase = needsConvert ? 'converting' : 'trimming';
+    onProgress({ type: 'progress', phase, percent: 97, downloadedMB: '0', totalMB: '0' });
+    const finalPath = await processFile({
+      inputPath: filePath,
+      targetExt: needsConvert ? convertTo : null,
+      startSec,
+      endSec,
+      isAborted: () => false,
+    });
+    return path.basename(finalPath);
+  };
+
+  // Compute expected final path (for activeDownloads tracking)
+  const baseName = isVideoOnly ? `${title}_${itag}_merged` : `${title}_${format.itag}`;
+  const finalExt = convertTo || baseExt;
+  const trimSuffix = trimRequested ? '_clip' : '';
+  const expectedPath = path.join(DOWNLOAD_DIR, `${baseName}${trimSuffix}.${finalExt}`);
+
+  activeDownloads.add(expectedPath);
+
+  try {
+    // Branch 1: video-only → parallel download + ffmpeg merge
+    if (isVideoOnly) {
+      const audioFormat = pickBestAudioForVideo(info.formats, format);
+      if (!audioFormat) throw new Error('No audio format available to merge.');
+
+      const ext = format.container || 'mp4';
+      const filePath = path.join(DOWNLOAD_DIR, `${title}_${itag}_merged.${ext}`);
+
+      await downloadAndMerge({
+        url,
+        videoFormat: format,
+        audioFormat,
+        outputPath: filePath,
+        isAborted: () => false,
+        onProgress: (data) => onProgress({ type: 'progress', ...data }),
+      });
+
+      const finalFilename = await maybeProcess(filePath, ext);
+      return { filename: finalFilename };
+    }
+
+    // Branch 2: single stream (pre-muxed or audio-only)
+    const contentLength = Number(format.contentLength) || 0;
+    const ext = format.container || 'mp4';
+    const filePath = path.join(DOWNLOAD_DIR, `${title}_${format.itag}.${ext}`);
+
+    await new Promise((resolve, reject) => {
+      const stream = ytdl(url, { format });
+      const fileStream = fs.createWriteStream(filePath);
+      let downloadedBytes = 0;
+      let lastSent = 0;
+      const startTime = Date.now();
+
+      stream.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        const now = Date.now();
+        if (now - lastSent >= 500) {
+          lastSent = now;
+          const downloadedMB = (downloadedBytes / (1024 * 1024)).toFixed(2);
+          const totalMB = contentLength ? (contentLength / (1024 * 1024)).toFixed(2) : 'unknown';
+          const rawPercent = contentLength ? Math.min((downloadedBytes / contentLength) * 100, 100) : null;
+          const percent = rawPercent !== null
+            ? Number((convertTo ? Math.min(rawPercent * 0.95, 95) : rawPercent).toFixed(1))
+            : null;
+          const elapsedSec = (now - startTime) / 1000;
+          const speedBps = elapsedSec > 0 ? downloadedBytes / elapsedSec : 0;
+          const speedMBs = (speedBps / (1024 * 1024)).toFixed(2);
+          const remainingBytes = contentLength - downloadedBytes;
+          const etaSec = speedBps > 0 && contentLength ? Math.ceil(remainingBytes / speedBps) : null;
+          onProgress({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB, speedMBs, etaSec });
+        }
+      });
+
+      stream.on('error', reject);
+      fileStream.on('error', reject);
+      fileStream.on('finish', resolve);
+      stream.pipe(fileStream);
+    });
+
+    const finalFilename = await maybeProcess(filePath, ext);
+    return { filename: finalFilename };
+  } finally {
+    activeDownloads.delete(expectedPath);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// BullMQ job queue -- offloads downloads to a worker with concurrency control.
+// Falls back to direct execution if Redis is unavailable.
+// ---------------------------------------------------------------------------
+const redisConnection = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT || '6379', 10),
+};
+
+let downloadQueue = null;
+let queueEvents = null;
+
+async function initQueue() {
+  // Quick connectivity test using raw ioredis to avoid BullMQ's internal reconnect noise
+  const IORedis = require('ioredis');
+  const testClient = new IORedis({
+    ...redisConnection,
+    maxRetriesPerRequest: 0,
+    retryStrategy: () => null,
+    lazyConnect: true,
+  });
+  testClient.on('error', () => {}); // swallow connection noise
+
+  try {
+    await testClient.connect();
+    await testClient.ping();
+    await testClient.quit();
+  } catch {
+    testClient.disconnect();
+    downloadQueue = null;
+    queueEvents = null;
+    console.log('Job queue disabled (Redis not available — using direct downloads)');
+    return;
+  }
+
+  // Connection verified — create the real queue, worker, and event listener
+  downloadQueue = new Queue('downloads', { connection: redisConnection });
+  queueEvents = new QueueEvents('downloads', { connection: redisConnection });
+
+  new Worker('downloads', async (job) => {
+    return executeDownload({
+      ...job.data,
+      onProgress: (data) => job.updateProgress(data),
+    });
+  }, {
+    connection: redisConnection,
+    concurrency: 3,
+  });
+
+  console.log('Job queue enabled (Redis connected, concurrency: 3)');
+}
+
+initQueue();
+
+// ---------------------------------------------------------------------------
+// GET /download-progress -- SSE endpoint for download progress tracking.
+// If Redis is available, creates a BullMQ job and polls progress.
+// Otherwise falls back to executing the download directly.
 // ---------------------------------------------------------------------------
 app.get('/download-progress', downloadLimiter, async (req, res) => {
   const { url, itag, convertTo, start, end } = req.query;
 
   const urlError = validateUrl(url);
-  if (urlError) {
-    return res.status(400).json({ error: urlError });
-  }
+  if (urlError) return res.status(400).json({ error: urlError });
 
   const itagError = validateItag(itag);
-  if (itagError) {
-    return res.status(400).json({ error: itagError });
-  }
+  if (itagError) return res.status(400).json({ error: itagError });
 
   const convertError = validateConvertTo(convertTo);
-  if (convertError) {
-    return res.status(400).json({ error: convertError });
-  }
+  if (convertError) return res.status(400).json({ error: convertError });
 
   const trimError = validateTrim(start, end);
-  if (trimError) {
-    return res.status(400).json({ error: trimError });
-  }
+  if (trimError) return res.status(400).json({ error: trimError });
 
   const startSec = parseTime(start);
   const endSec = parseTime(end);
@@ -630,204 +795,103 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   }
 
-  let aborted = false;
-  let stream = null;
+  let closed = false;
+  req.on('close', () => { closed = true; });
 
-  // On disconnect: stop sending SSE events but let the download finish to disk
-  // so the file is ready if the user retries.
-  req.on('close', () => {
-    aborted = true;
-  });
-
-  // Helper to run optional trim + conversion phase after a download/merge.
-  // Returns the final filename to serve.
-  const maybeProcess = async (filePath, currentExt) => {
-    const needsConvert = convertTo && convertTo !== currentExt;
-    if (!needsConvert && !trimRequested) {
-      return path.basename(filePath);
-    }
-    const phase = needsConvert ? 'converting' : 'trimming';
-    sendEvent({
-      type: 'progress',
-      phase,
-      percent: 97,
-      downloadedMB: '0',
-      totalMB: '0',
-    });
-    const finalPath = await processFile({
-      inputPath: filePath,
-      targetExt: needsConvert ? convertTo : null,
-      startSec,
-      endSec,
-      isAborted: () => aborted,
-    });
-    return path.basename(finalPath);
-  };
-
+  // -----------------------------------------------------------------------
+  // Instant resume: check if the expected file already exists on disk.
+  // -----------------------------------------------------------------------
   try {
     const info = await ytdl.getInfo(url);
-    const requestedFormat = info.formats.find(f => String(f.itag) === String(itag));
-
-    if (!requestedFormat) {
-      sendEvent({ type: 'error', message: 'Format not found for the given itag' });
-      return res.end();
-    }
-
-    const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
-    const targetIsAudio = convertTo && CONVERSION_PRESETS[convertTo].kind === 'audio';
-
-    // -----------------------------------------------------------------------
-    // Smart routing: if user wants audio output but picked a video itag,
-    // skip the video stream entirely and download best audio-only instead.
-    // -----------------------------------------------------------------------
-    let format = requestedFormat;
-    if (targetIsAudio && requestedFormat.hasVideo) {
-      const audioOnly = info.formats.filter(f => f.hasAudio && !f.hasVideo);
-      if (audioOnly.length > 0) {
-        format = audioOnly.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+    const reqFmt = info.formats.find(f => String(f.itag) === String(itag));
+    if (reqFmt) {
+      const targetIsAudio = convertTo && CONVERSION_PRESETS[convertTo]?.kind === 'audio';
+      let fmt = reqFmt;
+      if (targetIsAudio && reqFmt.hasVideo) {
+        const ao = info.formats.filter(f => f.hasAudio && !f.hasVideo);
+        if (ao.length) fmt = ao.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
       }
-    }
+      const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+      const isVO = fmt.hasVideo && !fmt.hasAudio;
+      const bExt = fmt.container || 'mp4';
+      const bName = isVO ? `${title}_${itag}_merged` : `${title}_${fmt.itag}`;
+      const fExt = convertTo || bExt;
+      const tSuffix = trimRequested ? '_clip' : '';
+      const expectedFilename = `${bName}${tSuffix}.${fExt}`;
+      const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
 
-    const isVideoOnly = format.hasVideo && !format.hasAudio;
-
-    // -----------------------------------------------------------------------
-    // Instant resume: if the final file already exists on disk and is not
-    // currently being downloaded, skip re-download and serve it immediately.
-    // -----------------------------------------------------------------------
-    const baseExt = format.container || 'mp4';
-    const baseName = isVideoOnly
-      ? `${title}_${itag}_merged`
-      : `${title}_${format.itag}`;
-    const finalExt = convertTo || baseExt;
-    const trimSuffix = (startSec !== null || endSec !== null) ? '_clip' : '';
-    const expectedFilename = `${baseName}${trimSuffix}.${finalExt}`;
-    const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
-
-    if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
-      sendEvent({ type: 'complete', filename: expectedFilename });
-      return res.end();
-    }
-
-    // -----------------------------------------------------------------------
-    // Branch 1: video-only format -> download + audio + ffmpeg merge
-    // -----------------------------------------------------------------------
-    if (isVideoOnly) {
-      const audioFormat = pickBestAudioForVideo(info.formats, format);
-      if (!audioFormat) {
-        sendEvent({ type: 'error', message: 'No audio format available to merge.' });
+      if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
+        sendEvent({ type: 'complete', filename: expectedFilename });
         return res.end();
       }
-
-      const ext = format.container || 'mp4';
-      const mergedFilename = `${title}_${itag}_merged.${ext}`;
-      const filePath = path.join(DOWNLOAD_DIR, mergedFilename);
-
-      activeDownloads.add(expectedPath);
-      try {
-        await downloadAndMerge({
-          url,
-          videoFormat: format,
-          audioFormat,
-          outputPath: filePath,
-          isAborted: () => aborted,
-          onProgress: (data) => {
-            if (aborted) return;
-            sendEvent({ type: 'progress', ...data });
-          },
-        });
-
-        activeDownloads.delete(expectedPath);
-        if (aborted) return;
-        const finalFilename = await maybeProcess(filePath, ext);
-        if (aborted) return;
-        sendEvent({ type: 'complete', filename: finalFilename });
-        res.end();
-      } catch (err) {
-        activeDownloads.delete(expectedPath);
-        if (!aborted) {
-          sendEvent({ type: 'error', message: err.message });
-          res.end();
-        }
-      }
-      return;
     }
+  } catch {
+    // Continue to download if resume check fails
+  }
 
-    // -----------------------------------------------------------------------
-    // Branch 2: pre-muxed (video+audio) or audio-only -> single stream
-    // -----------------------------------------------------------------------
-    const contentLength = Number(format.contentLength) || 0;
-    const ext = format.container || 'mp4';
-    const filename = `${title}_${format.itag}.${ext}`;
-    const filePath = path.join(DOWNLOAD_DIR, filename);
+  const jobParams = { url, itag, convertTo: convertTo || null, startSec, endSec, trimRequested };
 
-    activeDownloads.add(expectedPath);
-    stream = ytdl(url, { format });
-    const fileStream = fs.createWriteStream(filePath);
+  // -----------------------------------------------------------------------
+  // Queue path: create a BullMQ job and poll its progress
+  // -----------------------------------------------------------------------
+  if (downloadQueue && queueEvents) {
+    try {
+      const job = await downloadQueue.add('download', jobParams, {
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 3000 },
+      });
 
-    let downloadedBytes = 0;
-    let lastSent = 0;
-    const THROTTLE_MS = 500;
-    const singleStartTime = Date.now();
+      let lastProgress = null;
+      const pollInterval = setInterval(async () => {
+        if (closed) { clearInterval(pollInterval); return; }
+        try {
+          const { Job } = require('bullmq');
+          const fresh = await Job.fromId(downloadQueue, job.id);
+          if (!fresh) return;
 
-    stream.on('data', (chunk) => {
-      if (aborted) return;
-      downloadedBytes += chunk.length;
+          const progress = fresh.progress;
+          if (progress && typeof progress === 'object' && progress.type) {
+            const key = JSON.stringify(progress);
+            if (key !== lastProgress) {
+              lastProgress = key;
+              sendEvent(progress);
+            }
+          }
 
-      const now = Date.now();
-      if (now - lastSent >= THROTTLE_MS) {
-        lastSent = now;
-        const downloadedMB = (downloadedBytes / (1024 * 1024)).toFixed(2);
-        const totalMB = contentLength
-          ? (contentLength / (1024 * 1024)).toFixed(2)
-          : 'unknown';
-        const rawPercent = contentLength
-          ? Math.min((downloadedBytes / contentLength) * 100, 100)
-          : null;
-        const percent = rawPercent !== null
-          ? Number((convertTo ? Math.min(rawPercent * 0.95, 95) : rawPercent).toFixed(1))
-          : null;
-        const elapsedSec = (now - singleStartTime) / 1000;
-        const speedBps = elapsedSec > 0 ? downloadedBytes / elapsedSec : 0;
-        const speedMBs = (speedBps / (1024 * 1024)).toFixed(2);
-        const remainingBytes = contentLength - downloadedBytes;
-        const etaSec = speedBps > 0 && contentLength ? Math.ceil(remainingBytes / speedBps) : null;
+          const state = await fresh.getState();
+          if (state === 'completed') {
+            clearInterval(pollInterval);
+            sendEvent({ type: 'complete', filename: fresh.returnvalue?.filename });
+            res.end();
+          } else if (state === 'failed') {
+            clearInterval(pollInterval);
+            sendEvent({ type: 'error', message: fresh.failedReason || 'Download failed' });
+            res.end();
+          }
+        } catch { /* ignore poll errors */ }
+      }, 500);
 
-        sendEvent({ type: 'progress', phase: 'downloading', percent, downloadedMB, totalMB, speedMBs, etaSec });
-      }
+      req.on('close', () => clearInterval(pollInterval));
+      return;
+    } catch {
+      // Fall through to direct execution if job creation fails
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Direct path (no Redis): execute download inline
+  // -----------------------------------------------------------------------
+  try {
+    const result = await executeDownload({
+      ...jobParams,
+      onProgress: (data) => { if (!closed) sendEvent(data); },
     });
-
-    stream.pipe(fileStream);
-
-    fileStream.on('finish', async () => {
-      activeDownloads.delete(expectedPath);
-      if (aborted) return;
-      try {
-        const finalFilename = await maybeProcess(filePath, ext);
-        if (aborted) return;
-        sendEvent({ type: 'complete', filename: finalFilename });
-        res.end();
-      } catch (err) {
-        if (!aborted) {
-          sendEvent({ type: 'error', message: err.message });
-          res.end();
-        }
-      }
-    });
-
-    stream.on('error', (err) => {
-      activeDownloads.delete(expectedPath);
-      if (aborted) return;
-      sendEvent({ type: 'error', message: err.message });
+    if (!closed) {
+      sendEvent({ type: 'complete', filename: result.filename });
       res.end();
-    });
-
-    fileStream.on('error', (err) => {
-      if (aborted) return;
-      sendEvent({ type: 'error', message: err.message });
-      res.end();
-    });
+    }
   } catch (err) {
-    if (!aborted) {
+    if (!closed) {
       sendEvent({ type: 'error', message: err.message });
       res.end();
     }
