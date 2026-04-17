@@ -11,6 +11,21 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const { Queue, Worker, QueueEvents } = require('bullmq');
 const { WebSocketServer } = require('ws');
+const pino = require('pino');
+const pinoHttp = require('pino-http');
+
+// ---------------------------------------------------------------------------
+// Structured logger -- pretty-printed in dev, JSON in production
+// ---------------------------------------------------------------------------
+const logger = pino({
+  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
+  ...(process.env.NODE_ENV !== 'production' && {
+    transport: {
+      target: 'pino-pretty',
+      options: { colorize: true, translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname' },
+    },
+  }),
+});
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -32,16 +47,20 @@ app.use(cors({
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// Simple request logger (morgan-style, no extra dependency)
+// Structured HTTP request logger (pino-http)
 // ---------------------------------------------------------------------------
-app.use((req, res, next) => {
-  const start = Date.now();
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
-  });
-  next();
-});
+app.use(pinoHttp({
+  logger,
+  customLogLevel: (_req, res, err) => {
+    if (err || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  serializers: {
+    req: (req) => ({ method: req.method, url: req.url }),
+    res: (res) => ({ statusCode: res.statusCode }),
+  },
+}));
 
 // ---------------------------------------------------------------------------
 // Rate limiting
@@ -102,9 +121,9 @@ if (storageEnabled) {
     },
     forcePathStyle: !!process.env.S3_ENDPOINT,
   });
-  console.log(`Storage backend: S3/R2 (bucket: ${S3_BUCKET})`);
+  logger.info({ bucket: S3_BUCKET }, 'Storage backend: S3/R2');
 } else {
-  console.log('Storage backend: local disk');
+  logger.info('Storage backend: local disk');
 }
 
 async function uploadToStorage(localPath, key) {
@@ -549,11 +568,11 @@ cron.schedule('0 */1 * * * *', () => {
       const stats = fs.statSync(filePath);
       if (now - stats.ctimeMs > 60 * 60 * 1000) {
         fs.unlinkSync(filePath);
-        console.log(`Cleanup: deleted ${file}`);
+        logger.debug({ file }, 'Cleanup: deleted old file');
       }
     });
   } catch (err) {
-    console.log(`Cleanup error: ${err.message}`);
+    logger.warn({ err }, 'Cleanup error');
   }
 });
 
@@ -866,7 +885,7 @@ async function initQueue() {
     testClient.disconnect();
     downloadQueue = null;
     queueEvents = null;
-    console.log('Job queue disabled (Redis not available — using direct downloads)');
+    logger.warn('Job queue disabled — Redis not available, using direct downloads');
     return;
   }
 
@@ -891,7 +910,7 @@ async function initQueue() {
     concurrency: 3,
   });
 
-  console.log('Job queue enabled (Redis connected, concurrency: 3)');
+  logger.info({ concurrency: 3 }, 'Job queue enabled (Redis connected)');
 }
 
 initQueue();
@@ -1392,6 +1411,6 @@ wss.on('connection', async (ws, req) => {
 // Start server
 // ---------------------------------------------------------------------------
 server.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-  console.log(`WebSocket available at ws://localhost:${PORT}/download-ws`);
+  logger.info({ port: PORT }, `Server running on http://localhost:${PORT}`);
+  logger.info(`WebSocket available at ws://localhost:${PORT}/download-ws`);
 });
