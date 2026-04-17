@@ -78,9 +78,69 @@ app.use(globalLimiter);
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
-// Tracks file paths that are currently being downloaded so we don't serve
-// incomplete files as "already done" on a resume attempt.
+// Tracks filenames currently being downloaded so we don't serve incomplete
+// files as "already done" on a resume attempt. Works for both local + S3.
 const activeDownloads = new Set();
+
+// ---------------------------------------------------------------------------
+// Storage backend -- local disk (default) or S3-compatible object storage.
+// Enabled when S3_BUCKET env var is set. Works with AWS S3, Cloudflare R2,
+// MinIO, etc. (use S3_ENDPOINT for non-AWS providers).
+// ---------------------------------------------------------------------------
+const S3_BUCKET = process.env.S3_BUCKET || '';
+const storageEnabled = !!S3_BUCKET;
+let s3Client = null;
+
+if (storageEnabled) {
+  const { S3Client } = require('@aws-sdk/client-s3');
+  s3Client = new S3Client({
+    region: process.env.S3_REGION || 'auto',
+    endpoint: process.env.S3_ENDPOINT || undefined,
+    credentials: {
+      accessKeyId: process.env.S3_ACCESS_KEY_ID,
+      secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+    },
+    forcePathStyle: !!process.env.S3_ENDPOINT,
+  });
+  console.log(`Storage backend: S3/R2 (bucket: ${S3_BUCKET})`);
+} else {
+  console.log('Storage backend: local disk');
+}
+
+async function uploadToStorage(localPath, key) {
+  if (!storageEnabled) return;
+  const { Upload } = require('@aws-sdk/lib-storage');
+  const fileStream = fs.createReadStream(localPath);
+  const upload = new Upload({
+    client: s3Client,
+    params: { Bucket: S3_BUCKET, Key: key, Body: fileStream },
+  });
+  await upload.done();
+}
+
+async function getDownloadUrl(filename) {
+  const { GetObjectCommand } = require('@aws-sdk/client-s3');
+  const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+  const cmd = new GetObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: filename,
+    ResponseContentDisposition: `attachment; filename="${filename}"`,
+  });
+  return getSignedUrl(s3Client, cmd, { expiresIn: 3600 });
+}
+
+async function storageExists(filename) {
+  if (!storageEnabled) {
+    return fs.existsSync(path.join(DOWNLOAD_DIR, filename));
+  }
+  const { HeadObjectCommand } = require('@aws-sdk/client-s3');
+  try {
+    await s3Client.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: filename }));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // In-memory cache for video info (TTL = 10 min, max 100 entries)
@@ -476,9 +536,11 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup cron job -- delete files older than 1 hour
+// Cleanup cron job -- delete local files older than 1 hour. Only runs in
+// local mode; S3/R2 cleanup should be configured via bucket lifecycle rules.
 // ---------------------------------------------------------------------------
 cron.schedule('0 */1 * * * *', () => {
+  if (storageEnabled) return;
   try {
     const files = fs.readdirSync(DOWNLOAD_DIR);
     const now = Date.now();
@@ -651,13 +713,27 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
     return path.basename(finalPath);
   };
 
-  // Compute expected final path (for activeDownloads tracking)
+  // Expected final filename (for activeDownloads tracking + instant resume)
   const baseName = isVideoOnly ? `${title}_${itag}_merged` : `${title}_${format.itag}`;
   const finalExt = convertTo || baseExt;
   const trimSuffix = trimRequested ? '_clip' : '';
-  const expectedPath = path.join(DOWNLOAD_DIR, `${baseName}${trimSuffix}.${finalExt}`);
+  const expectedFilename = `${baseName}${trimSuffix}.${finalExt}`;
 
-  activeDownloads.add(expectedPath);
+  activeDownloads.add(expectedFilename);
+
+  // Upload the produced local file to storage (if enabled) and delete locally.
+  const finalizeStorage = async (finalFilename) => {
+    if (!storageEnabled) return finalFilename;
+    const localPath = path.join(DOWNLOAD_DIR, finalFilename);
+    if (signal?.aborted) {
+      try { if (fs.existsSync(localPath)) fs.unlinkSync(localPath); } catch {}
+      throw new Error('Cancelled');
+    }
+    onProgress({ type: 'progress', phase: 'uploading', percent: 99, downloadedMB: '0', totalMB: '0' });
+    await uploadToStorage(localPath, finalFilename);
+    try { fs.unlinkSync(localPath); } catch {}
+    return finalFilename;
+  };
 
   try {
     // Branch 1: video-only → parallel download + ffmpeg merge
@@ -679,7 +755,7 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
       });
 
       const finalFilename = await maybeProcess(filePath, ext);
-      return { filename: finalFilename };
+      return { filename: await finalizeStorage(finalFilename) };
     }
 
     // Branch 2: single stream (pre-muxed or audio-only)
@@ -730,9 +806,9 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
     });
 
     const finalFilename = await maybeProcess(filePath, ext);
-    return { filename: finalFilename };
+    return { filename: await finalizeStorage(finalFilename) };
   } finally {
-    activeDownloads.delete(expectedPath);
+    activeDownloads.delete(expectedFilename);
   }
 }
 
@@ -882,9 +958,8 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
       const fExt = convertTo || bExt;
       const tSuffix = trimRequested ? '_clip' : '';
       const expectedFilename = `${bName}${tSuffix}.${fExt}`;
-      const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
 
-      if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
+      if (!activeDownloads.has(expectedFilename) && await storageExists(expectedFilename)) {
         sendEvent({ type: 'complete', filename: expectedFilename });
         return res.end();
       }
@@ -966,12 +1041,25 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
 // GET /download-file/:filename -- serve a downloaded file with Range support
 // so browsers can resume interrupted downloads (HTTP 206 Partial Content).
 // ---------------------------------------------------------------------------
-app.get('/download-file/:filename', (req, res) => {
+app.get('/download-file/:filename', async (req, res) => {
   const { filename } = req.params;
 
   // Path traversal protection
   if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
     return res.status(400).json({ error: 'Invalid filename.' });
+  }
+
+  // S3/R2: redirect to a signed URL (browser handles Range requests against S3)
+  if (storageEnabled) {
+    try {
+      if (!(await storageExists(filename))) {
+        return res.status(404).json({ error: 'File not found.' });
+      }
+      const signedUrl = await getDownloadUrl(filename);
+      return res.redirect(302, signedUrl);
+    } catch (err) {
+      return res.status(500).json({ error: 'Failed to generate download URL', details: err.message });
+    }
   }
 
   const filePath = path.join(DOWNLOAD_DIR, filename);
@@ -1205,9 +1293,7 @@ wss.on('connection', async (ws, req) => {
       const fExt = convertTo || bExt;
       const tSuffix = trimRequested ? '_clip' : '';
       const expectedFilename = `${bName}${tSuffix}.${fExt}`;
-      const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
-
-      if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
+      if (!activeDownloads.has(expectedFilename) && await storageExists(expectedFilename)) {
         send({ type: 'complete', filename: expectedFilename });
         ws.close();
         return;
