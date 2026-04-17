@@ -6,9 +6,11 @@ const ytpl = require('ytpl');
 const fs = require('fs');
 const path = require('path');
 const cron = require('node-cron');
+const http = require('http');
 const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const { Queue, Worker, QueueEvents } = require('bullmq');
+const { WebSocketServer } = require('ws');
 
 const app = express();
 const PORT = process.env.PORT || 5001;
@@ -292,7 +294,7 @@ function validateTrim(start, end) {
 // optional format conversion. Both operations run in a single ffmpeg pass when
 // combined. Deletes the source file on success and returns the new file path.
 // ---------------------------------------------------------------------------
-async function processFile({ inputPath, targetExt, startSec, endSec, isAborted }) {
+async function processFile({ inputPath, targetExt, startSec, endSec, isAborted, signal }) {
   const trimRequested = startSec !== null || endSec !== null;
   const convertRequested = !!targetExt;
   if (!trimRequested && !convertRequested) return inputPath;
@@ -330,7 +332,12 @@ async function processFile({ inputPath, targetExt, startSec, endSec, isAborted }
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg post-process exited with code ${code}`));
     });
-    if (isAborted && isAborted()) ff.kill('SIGKILL');
+    if ((isAborted && isAborted()) || signal?.aborted) ff.kill('SIGKILL');
+    if (signal) {
+      const onAbort = () => ff.kill('SIGKILL');
+      signal.addEventListener('abort', onAbort, { once: true });
+      ff.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
   });
 
   try { if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath); } catch {}
@@ -357,7 +364,7 @@ function pickBestAudioForVideo(formats, videoFormat) {
 // Download video-only + audio-only streams in parallel and mux with ffmpeg.
 // onProgress receives { phase, percent, downloadedMB, totalMB }.
 // ---------------------------------------------------------------------------
-async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onProgress, isAborted }) {
+async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onProgress, isAborted, signal }) {
   const tempVideo = `${outputPath}.video.tmp`;
   const tempAudio = `${outputPath}.audio.tmp`;
 
@@ -397,11 +404,17 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
     const stream = ytdl(url, { format });
     const file = fs.createWriteStream(dest);
     stream.on('data', (chunk) => {
+      if (signal?.aborted) { stream.destroy(); return; }
       onByte(chunk.length);
     });
     stream.on('error', reject);
     file.on('error', reject);
     file.on('finish', resolve);
+    if (signal) {
+      const onAbort = () => { stream.destroy(new Error('Cancelled')); };
+      signal.addEventListener('abort', onAbort, { once: true });
+      file.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
     stream.pipe(file);
   });
 
@@ -413,6 +426,11 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
   } catch (err) {
     cleanupTemps();
     throw err;
+  }
+
+  if (signal?.aborted) {
+    cleanupTemps();
+    throw new Error('Cancelled');
   }
 
   // Merge phase — continue even if client disconnected so the file is ready
@@ -440,6 +458,11 @@ async function downloadAndMerge({ url, videoFormat, audioFormat, outputPath, onP
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exited with code ${code}`));
     });
+    if (signal) {
+      const onAbort = () => ff.kill('SIGKILL');
+      signal.addEventListener('abort', onAbort, { once: true });
+      ff.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
   });
 
   cleanupTemps();
@@ -591,7 +614,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 // and (as fallback) direct SSE execution. Reports progress via onProgress().
 // Returns { filename } on success or throws on error.
 // ---------------------------------------------------------------------------
-async function executeDownload({ url, itag, convertTo, startSec, endSec, trimRequested, onProgress }) {
+async function executeDownload({ url, itag, convertTo, startSec, endSec, trimRequested, onProgress, signal }) {
   const info = await ytdl.getInfo(url);
   const requestedFormat = info.formats.find(f => String(f.itag) === String(itag));
   if (!requestedFormat) throw new Error('Format not found for the given itag');
@@ -623,6 +646,7 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
       startSec,
       endSec,
       isAborted: () => false,
+      signal,
     });
     return path.basename(finalPath);
   };
@@ -650,6 +674,7 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
         audioFormat,
         outputPath: filePath,
         isAborted: () => false,
+        signal,
         onProgress: (data) => onProgress({ type: 'progress', ...data }),
       });
 
@@ -670,6 +695,7 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
       const startTime = Date.now();
 
       stream.on('data', (chunk) => {
+        if (signal?.aborted) { stream.destroy(); return; }
         downloadedBytes += chunk.length;
         const now = Date.now();
         if (now - lastSent >= 500) {
@@ -691,7 +717,15 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
 
       stream.on('error', reject);
       fileStream.on('error', reject);
-      fileStream.on('finish', resolve);
+      fileStream.on('finish', () => {
+        if (signal?.aborted) reject(new Error('Cancelled'));
+        else resolve();
+      });
+      if (signal) {
+        const onAbort = () => { stream.destroy(new Error('Cancelled')); };
+        signal.addEventListener('abort', onAbort, { once: true });
+        fileStream.on('close', () => signal.removeEventListener('abort', onAbort));
+      }
       stream.pipe(fileStream);
     });
 
@@ -713,6 +747,29 @@ const redisConnection = {
 
 let downloadQueue = null;
 let queueEvents = null;
+
+// Maps BullMQ job IDs to AbortControllers so /download-ws can cancel running
+// jobs. Only populated for jobs currently being processed in this process.
+const activeControllers = new Map();
+
+async function cancelJob(jobId) {
+  const controller = activeControllers.get(String(jobId));
+  if (controller) {
+    controller.abort();
+    return true;
+  }
+  if (downloadQueue) {
+    try {
+      const { Job } = require('bullmq');
+      const job = await Job.fromId(downloadQueue, jobId);
+      if (job) {
+        await job.remove();
+        return true;
+      }
+    } catch { /* ignore */ }
+  }
+  return false;
+}
 
 async function initQueue() {
   // Quick connectivity test using raw ioredis to avoid BullMQ's internal reconnect noise
@@ -742,10 +799,17 @@ async function initQueue() {
   queueEvents = new QueueEvents('downloads', { connection: redisConnection });
 
   new Worker('downloads', async (job) => {
-    return executeDownload({
-      ...job.data,
-      onProgress: (data) => job.updateProgress(data),
-    });
+    const controller = new AbortController();
+    activeControllers.set(String(job.id), controller);
+    try {
+      return await executeDownload({
+        ...job.data,
+        signal: controller.signal,
+        onProgress: (data) => job.updateProgress(data),
+      });
+    } finally {
+      activeControllers.delete(String(job.id));
+    }
   }, {
     connection: redisConnection,
     concurrency: 3,
@@ -1091,8 +1155,157 @@ app.post('/playlist', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// WebSocket server -- /download-ws bidirectional endpoint with real cancel
+// ---------------------------------------------------------------------------
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/download-ws' });
+
+wss.on('connection', async (ws, req) => {
+  const params = new URL(req.url, 'http://localhost').searchParams;
+  const url = params.get('url');
+  const itag = params.get('itag');
+  const convertTo = params.get('convertTo') || '';
+  const start = params.get('start') || '';
+  const end = params.get('end') || '';
+
+  const send = (data) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(data));
+  };
+
+  // Validation
+  const urlError = validateUrl(url);
+  if (urlError) { send({ type: 'error', message: urlError }); ws.close(); return; }
+  const itagError = validateItag(itag);
+  if (itagError) { send({ type: 'error', message: itagError }); ws.close(); return; }
+  const convertError = validateConvertTo(convertTo);
+  if (convertError) { send({ type: 'error', message: convertError }); ws.close(); return; }
+  const trimError = validateTrim(start, end);
+  if (trimError) { send({ type: 'error', message: trimError }); ws.close(); return; }
+  if (!ytdl.validateURL(url)) { send({ type: 'error', message: 'Invalid URL' }); ws.close(); return; }
+
+  const startSec = parseTime(start);
+  const endSec = parseTime(end);
+  const trimRequested = startSec !== null || endSec !== null;
+
+  // Instant resume check
+  try {
+    const info = await ytdl.getInfo(url);
+    const reqFmt = info.formats.find(f => String(f.itag) === String(itag));
+    if (reqFmt) {
+      const targetIsAudio = convertTo && CONVERSION_PRESETS[convertTo]?.kind === 'audio';
+      let fmt = reqFmt;
+      if (targetIsAudio && reqFmt.hasVideo) {
+        const ao = info.formats.filter(f => f.hasAudio && !f.hasVideo);
+        if (ao.length) fmt = ao.sort((a, b) => (b.audioBitrate || 0) - (a.audioBitrate || 0))[0];
+      }
+      const title = info.videoDetails.title.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+      const isVO = fmt.hasVideo && !fmt.hasAudio;
+      const bExt = fmt.container || 'mp4';
+      const bName = isVO ? `${title}_${itag}_merged` : `${title}_${fmt.itag}`;
+      const fExt = convertTo || bExt;
+      const tSuffix = trimRequested ? '_clip' : '';
+      const expectedFilename = `${bName}${tSuffix}.${fExt}`;
+      const expectedPath = path.join(DOWNLOAD_DIR, expectedFilename);
+
+      if (fs.existsSync(expectedPath) && !activeDownloads.has(expectedPath)) {
+        send({ type: 'complete', filename: expectedFilename });
+        ws.close();
+        return;
+      }
+    }
+  } catch { /* continue */ }
+
+  const jobParams = { url, itag, convertTo: convertTo || null, startSec, endSec, trimRequested };
+
+  // Queue path
+  if (downloadQueue && queueEvents) {
+    try {
+      const job = await downloadQueue.add('download', jobParams, {
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 3000 },
+      });
+
+      ws.on('message', async (raw) => {
+        try {
+          const msg = JSON.parse(raw.toString());
+          if (msg.type === 'cancel') {
+            await cancelJob(job.id);
+            send({ type: 'cancelled' });
+            ws.close();
+          }
+        } catch { /* ignore */ }
+      });
+
+      let lastProgress = null;
+      const pollInterval = setInterval(async () => {
+        if (ws.readyState !== ws.OPEN) { clearInterval(pollInterval); return; }
+        try {
+          const { Job } = require('bullmq');
+          const fresh = await Job.fromId(downloadQueue, job.id);
+          if (!fresh) return;
+
+          const progress = fresh.progress;
+          if (progress && typeof progress === 'object' && progress.type) {
+            const key = JSON.stringify(progress);
+            if (key !== lastProgress) {
+              lastProgress = key;
+              send(progress);
+            }
+          }
+
+          const state = await fresh.getState();
+          if (state === 'completed') {
+            clearInterval(pollInterval);
+            send({ type: 'complete', filename: fresh.returnvalue?.filename });
+            ws.close();
+          } else if (state === 'failed') {
+            clearInterval(pollInterval);
+            send({ type: 'error', message: fresh.failedReason || 'Download failed' });
+            ws.close();
+          }
+        } catch { /* ignore */ }
+      }, 500);
+
+      ws.on('close', () => clearInterval(pollInterval));
+      return;
+    } catch {
+      // Fall through to direct mode
+    }
+  }
+
+  // Direct path (no Redis)
+  const controller = new AbortController();
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type === 'cancel') {
+        controller.abort();
+        send({ type: 'cancelled' });
+        ws.close();
+      }
+    } catch { /* ignore */ }
+  });
+
+  try {
+    const result = await executeDownload({
+      ...jobParams,
+      signal: controller.signal,
+      onProgress: (data) => send(data),
+    });
+    send({ type: 'complete', filename: result.filename });
+  } catch (err) {
+    if (!controller.signal.aborted) {
+      send({ type: 'error', message: err.message });
+    }
+  } finally {
+    ws.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Start server
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`WebSocket available at ws://localhost:${PORT}/download-ws`);
 });

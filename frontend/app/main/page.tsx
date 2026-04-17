@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Image from 'next/image';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -88,6 +88,12 @@ export default function Main() {
   const [batchRunning, setBatchRunning] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
+  const activeWsRef = useRef<WebSocket | null>(null);
+
+  const buildWsUrl = (params: URLSearchParams) => {
+    const wsBase = BASE_URL.replace(/^http/, 'ws');
+    return `${wsBase}/download-ws?${params.toString()}`;
+  };
   const router = useRouter();
 
   const isYouTubeUrl = (text: string) =>
@@ -275,11 +281,12 @@ export default function Main() {
     if (convertTo) params.set('convertTo', convertTo);
     if (trimStart) params.set('start', trimStart);
     if (trimEnd) params.set('end', trimEnd);
-    const eventSource = new EventSource(`${BASE_URL}/download-progress?${params.toString()}`);
 
+    const ws = new WebSocket(buildWsUrl(params));
+    activeWsRef.current = ws;
     let completed = false;
 
-    eventSource.onmessage = (event) => {
+    ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
 
@@ -297,29 +304,46 @@ export default function Main() {
           if (data.filename) {
             window.open(`${BASE_URL}/download-file/${data.filename}`);
           }
-          eventSource.close();
           setDownloadLoading(false);
           setProgress(null);
           toast.success('Download complete!');
         } else if (data.type === 'error') {
           completed = true;
-          eventSource.close();
           setDownloadLoading(false);
           setProgress(null);
           toast.error(data.message || 'Download failed');
+        } else if (data.type === 'cancelled') {
+          completed = true;
+          setDownloadLoading(false);
+          setProgress(null);
+          toast.info('Download cancelled');
         }
-      } catch {
-        // ignore parse errors
+      } catch { /* ignore */ }
+    };
+
+    ws.onclose = () => {
+      activeWsRef.current = null;
+      if (!completed) {
+        setDownloadLoading(false);
+        setProgress(null);
       }
     };
 
-    eventSource.onerror = () => {
+    ws.onerror = () => {
       if (completed) return;
-      eventSource.close();
-      toast.error('Download failed');
+      toast.error('Connection failed');
       setDownloadLoading(false);
       setProgress(null);
     };
+  };
+
+  const cancelDownload = () => {
+    const ws = activeWsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cancel' }));
+    } else if (ws) {
+      ws.close();
+    }
   };
 
   const updateBatchItem = (index: number, updates: Partial<BatchItem>) => {
@@ -381,10 +405,10 @@ export default function Main() {
           if (trimStart) params.set('start', trimStart);
           if (trimEnd) params.set('end', trimEnd);
 
-          const eventSource = new EventSource(`${BASE_URL}/download-progress?${params.toString()}`);
+          const ws = new WebSocket(buildWsUrl(params));
           let done = false;
 
-          eventSource.onmessage = (event) => {
+          ws.onmessage = (event) => {
             try {
               const data = JSON.parse(event.data);
               if (data.type === 'progress') {
@@ -395,21 +419,19 @@ export default function Main() {
                 if (data.filename) {
                   window.open(`${BASE_URL}/download-file/${data.filename}`);
                 }
-                eventSource.close();
                 resolve();
               } else if (data.type === 'error') {
                 done = true;
                 updateBatchItem(i, { status: 'error', error: data.message });
-                eventSource.close();
                 resolve();
               }
             } catch { /* ignore */ }
           };
 
-          eventSource.onerror = () => {
+          ws.onclose = () => { if (!done) resolve(); };
+          ws.onerror = () => {
             if (done) return;
             updateBatchItem(i, { status: 'error', error: 'Connection failed' });
-            eventSource.close();
             resolve();
           };
         });
@@ -891,6 +913,14 @@ export default function Main() {
                         style={{ width: `${progress.percent}%` }}
                       />
                     </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={cancelDownload}
+                      className="w-full"
+                    >
+                      Cancel
+                    </Button>
                   </div>
                 )}
 
