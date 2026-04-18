@@ -24,6 +24,41 @@ const { Queue, Worker, QueueEvents } = require('bullmq');
 const { WebSocketServer } = require('ws');
 const pino = require('pino');
 const pinoHttp = require('pino-http');
+const promClient = require('prom-client');
+
+// ---------------------------------------------------------------------------
+// Prometheus metrics -- default Node process metrics + custom app metrics
+// ---------------------------------------------------------------------------
+const metricsRegistry = new promClient.Registry();
+promClient.collectDefaultMetrics({ register: metricsRegistry });
+
+const httpRequestsTotal = new promClient.Counter({
+  name: 'http_requests_total',
+  help: 'Total HTTP requests received, labeled by method, route, and status code.',
+  labelNames: ['method', 'route', 'status'],
+  registers: [metricsRegistry],
+});
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration in seconds, labeled by method, route, and status code.',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60],
+  registers: [metricsRegistry],
+});
+
+const downloadsTotal = new promClient.Counter({
+  name: 'downloads_total',
+  help: 'Total number of downloads, labeled by outcome.',
+  labelNames: ['status'],
+  registers: [metricsRegistry],
+});
+
+const downloadsInProgress = new promClient.Gauge({
+  name: 'downloads_in_progress',
+  help: 'Number of downloads currently running.',
+  registers: [metricsRegistry],
+});
 
 // ---------------------------------------------------------------------------
 // Structured logger -- pretty-printed in dev, JSON in production
@@ -72,6 +107,19 @@ app.use(pinoHttp({
     res: (res) => ({ statusCode: res.statusCode }),
   },
 }));
+
+// HTTP metrics middleware -- record counts and durations per route
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const route = req.route?.path || req.path.replace(/\/[0-9a-f-]{8,}/gi, '/:id') || 'unknown';
+    const labels = { method: req.method, route, status: String(res.statusCode) };
+    httpRequestsTotal.inc(labels);
+    const durationSec = Number(process.hrtime.bigint() - start) / 1e9;
+    httpRequestDuration.observe(labels, durationSec);
+  });
+  next();
+});
 
 // ---------------------------------------------------------------------------
 // Rate limiting
@@ -595,6 +643,18 @@ app.get('/health', (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Prometheus metrics endpoint
+// ---------------------------------------------------------------------------
+app.get('/metrics', async (_req, res) => {
+  try {
+    res.set('Content-Type', metricsRegistry.contentType);
+    res.end(await metricsRegistry.metrics());
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to collect metrics', details: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // GET /info -- fetch video info and available formats
 // ---------------------------------------------------------------------------
 app.post('/info', infoLimiter, async (req, res) => {
@@ -907,14 +967,22 @@ async function initQueue() {
   new Worker('downloads', async (job) => {
     const controller = new AbortController();
     activeControllers.set(String(job.id), controller);
+    downloadsInProgress.inc();
     try {
-      return await executeDownload({
+      const result = await executeDownload({
         ...job.data,
         signal: controller.signal,
         onProgress: (data) => job.updateProgress(data),
       });
+      downloadsTotal.inc({ status: 'completed' });
+      return result;
+    } catch (err) {
+      const status = controller.signal.aborted ? 'cancelled' : 'failed';
+      downloadsTotal.inc({ status });
+      throw err;
     } finally {
       activeControllers.delete(String(job.id));
+      downloadsInProgress.dec();
     }
   }, {
     connection: redisConnection,
@@ -1050,20 +1118,25 @@ app.get('/download-progress', downloadLimiter, async (req, res) => {
   // -----------------------------------------------------------------------
   // Direct path (no Redis): execute download inline
   // -----------------------------------------------------------------------
+  downloadsInProgress.inc();
   try {
     const result = await executeDownload({
       ...jobParams,
       onProgress: (data) => { if (!closed) sendEvent(data); },
     });
+    downloadsTotal.inc({ status: 'completed' });
     if (!closed) {
       sendEvent({ type: 'complete', filename: result.filename });
       res.end();
     }
   } catch (err) {
+    downloadsTotal.inc({ status: 'failed' });
     if (!closed) {
       sendEvent({ type: 'error', message: err.message });
       res.end();
     }
+  } finally {
+    downloadsInProgress.dec();
   }
 });
 
@@ -1402,18 +1475,23 @@ wss.on('connection', async (ws, req) => {
     } catch { /* ignore */ }
   });
 
+  downloadsInProgress.inc();
   try {
     const result = await executeDownload({
       ...jobParams,
       signal: controller.signal,
       onProgress: (data) => send(data),
     });
+    downloadsTotal.inc({ status: 'completed' });
     send({ type: 'complete', filename: result.filename });
   } catch (err) {
+    const status = controller.signal.aborted ? 'cancelled' : 'failed';
+    downloadsTotal.inc({ status });
     if (!controller.signal.aborted) {
       send({ type: 'error', message: err.message });
     }
   } finally {
+    downloadsInProgress.dec();
     ws.close();
   }
 });
