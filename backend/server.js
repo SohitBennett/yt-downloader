@@ -1,3 +1,14 @@
+// Sentry must be initialized before any other imports for auto-instrumentation
+// to hook into them. No-op when SENTRY_DSN is unset.
+if (process.env.SENTRY_DSN) {
+  const Sentry = require('@sentry/node');
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'development',
+    tracesSampleRate: Number(process.env.SENTRY_TRACES_SAMPLE_RATE || '0.1'),
+  });
+}
+
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -1406,6 +1417,14 @@ wss.on('connection', async (ws, req) => {
     ws.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Sentry error handler -- must be registered AFTER all routes and middleware
+// ---------------------------------------------------------------------------
+if (process.env.SENTRY_DSN) {
+  const Sentry = require('@sentry/node');
+  Sentry.setupExpressErrorHandler(app);
+}
 
 // ---------------------------------------------------------------------------
 // Start server

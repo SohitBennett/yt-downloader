@@ -16,6 +16,7 @@
     "@aws-sdk/lib-storage": "^3.1031.0",
     "@aws-sdk/s3-request-presigner": "^3.1031.0",
     "@distube/ytdl-core": "^4.16.12",
+    "@sentry/node": "^10.49.0",
     "bullmq": "^5.73.4",
     "cors": "^2.8.5",
     "express": "^5.1.0",
