@@ -10,6 +10,7 @@ import axios from 'axios';
 import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
+import { Turnstile, type TurnstileHandle } from '../components/Turnstile';
 import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock, ImageDown, History } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -88,7 +89,10 @@ export default function Main() {
   const [batchRunning, setBatchRunning] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [recentSearches, setRecentSearches] = useState<RecentSearch[]>([]);
+  const [turnstileToken, setTurnstileToken] = useState<string>('');
   const activeWsRef = useRef<WebSocket | null>(null);
+  const turnstileRef = useRef<TurnstileHandle>(null);
+  const turnstileSiteKey = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY;
 
   const buildWsUrl = (params: URLSearchParams) => {
     const wsBase = BASE_URL.replace(/^http/, 'ws');
@@ -233,9 +237,13 @@ export default function Main() {
   };
 
   const fetchInfo = async () => {
+    if (turnstileSiteKey && !turnstileToken) {
+      toast.warning('Please complete the CAPTCHA first');
+      return;
+    }
     setLoading(true);
     try {
-      const res = await axios.post(`${BASE_URL}/info`, { url });
+      const res = await axios.post(`${BASE_URL}/info`, { url, turnstileToken });
       const allFormats = res.data.formats;
       const seen = new Set();
       const uniqueFormats = allFormats.filter((f: VideoFormat) => {
@@ -255,6 +263,11 @@ export default function Main() {
       saveRecentSearch(url, res.data.title || url);
     } catch {
       toast.error('Failed to fetch video info');
+    } finally {
+      if (turnstileSiteKey) {
+        setTurnstileToken('');
+        turnstileRef.current?.reset();
+      }
     }
     setLoading(false);
   };
@@ -385,7 +398,7 @@ export default function Main() {
 
       try {
         // Fetch info
-        const res = await axios.post(`${BASE_URL}/info`, { url: urls[i] });
+        const res = await axios.post(`${BASE_URL}/info`, { url: urls[i], turnstileToken });
         const title = res.data.title || urls[i];
         updateBatchItem(i, { title });
 
@@ -641,6 +654,17 @@ export default function Main() {
                         {s.title}
                       </button>
                     ))}
+                  </div>
+                )}
+
+                {turnstileSiteKey && (
+                  <div className="mt-4">
+                    <Turnstile
+                      ref={turnstileRef}
+                      siteKey={turnstileSiteKey}
+                      onVerify={setTurnstileToken}
+                      onError={() => setTurnstileToken('')}
+                    />
                   </div>
                 )}
 

@@ -487,6 +487,42 @@ function cleanUrl(url) {
 }
 
 // ---------------------------------------------------------------------------
+// Cloudflare Turnstile CAPTCHA -- protects high-value endpoints from scraping.
+// No-op when TURNSTILE_SECRET_KEY is unset (graceful fallback).
+// ---------------------------------------------------------------------------
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET_KEY || '';
+const turnstileEnabled = !!TURNSTILE_SECRET;
+
+async function verifyTurnstile(token, ip) {
+  if (!token) return false;
+  try {
+    const body = new URLSearchParams({ secret: TURNSTILE_SECRET, response: token });
+    if (ip) body.append('remoteip', ip);
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      body,
+    });
+    const data = await res.json();
+    return !!data.success;
+  } catch {
+    return false;
+  }
+}
+
+function requireTurnstile(getToken) {
+  return async (req, res, next) => {
+    if (!turnstileEnabled) return next();
+    const token = getToken(req);
+    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip;
+    const valid = await verifyTurnstile(token, ip);
+    if (!valid) {
+      return res.status(403).json({ error: 'CAPTCHA verification failed.' });
+    }
+    next();
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Pick the best audio-only format that matches a video format's container,
 // so ffmpeg can mux with `-c copy` (no re-encode).
 // ---------------------------------------------------------------------------
@@ -657,7 +693,7 @@ app.get('/metrics', async (_req, res) => {
 // ---------------------------------------------------------------------------
 // GET /info -- fetch video info and available formats
 // ---------------------------------------------------------------------------
-app.post('/info', infoLimiter, async (req, res) => {
+app.post('/info', infoLimiter, requireTurnstile(req => req.body?.turnstileToken), async (req, res) => {
   try {
     const { url } = req.body;
     const urlError = validateUrl(url);
