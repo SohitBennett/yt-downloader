@@ -122,13 +122,30 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
-// Rate limiting
+// API keys -- valid keys bypass all rate limits. Configure via API_KEYS env
+// var as a comma-separated list. Unset/empty means no privileged keys.
+// ---------------------------------------------------------------------------
+const API_KEYS = new Set(
+  (process.env.API_KEYS || '')
+    .split(',')
+    .map(k => k.trim())
+    .filter(Boolean),
+);
+
+function isValidApiKey(req) {
+  const key = req.headers['x-api-key'] || req.query?.apiKey;
+  return !!key && API_KEYS.has(String(key));
+}
+
+// ---------------------------------------------------------------------------
+// Rate limiting -- bypassed for requests with a valid API key
 // ---------------------------------------------------------------------------
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: isValidApiKey,
   message: { error: 'Too many requests, please try again later.' }
 });
 
@@ -137,6 +154,7 @@ const infoLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: isValidApiKey,
   message: { error: 'Too many info requests, please try again later.' }
 });
 
@@ -145,6 +163,7 @@ const downloadLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: isValidApiKey,
   message: { error: 'Too many download requests, please try again later.' }
 });
 
