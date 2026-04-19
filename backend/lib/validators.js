@@ -1,5 +1,9 @@
-// Pure validation + parsing helpers. Extracted to a module so they're
-// testable without booting the full Express server.
+// Pure validation + parsing helpers. Extracted so they're testable without
+// booting the full Express server.
+//
+// Type declarations live in validators.d.ts alongside this file — that gives
+// strict typing for consumers while keeping the source runnable by Node
+// without a TypeScript loader.
 
 const YOUTUBE_HOST_REGEX = /^(www\.)?youtube\.com$|^youtu\.be$|^m\.youtube\.com$/;
 
