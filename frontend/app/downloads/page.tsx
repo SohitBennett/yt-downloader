@@ -5,13 +5,7 @@ import Link from 'next/link';
 import { FolderOpen, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Navbar from '../components/Navbar';
-
-interface HistoryEntry {
-  title: string;
-  url: string;
-  type: 'single' | 'playlist-video' | 'playlist-audio';
-  timestamp: number;
-}
+import type { HistoryEntry } from '@shared/types';
 
 export default function DownloadsPage() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);

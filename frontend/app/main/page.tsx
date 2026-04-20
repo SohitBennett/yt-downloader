@@ -11,6 +11,7 @@ import BASE_URL from '@/config';
 import { useRouter } from 'next/navigation';
 import Navbar from '../components/Navbar';
 import { Turnstile, type TurnstileHandle } from '../components/Turnstile';
+import type { VideoFormat, CaptionTrack, HistoryEntry } from '@shared/types';
 import { Video, Search, Volume2, ScrollText, Captions, CheckCircle2, XCircle, Loader2, Clock, ImageDown, History } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -18,31 +19,6 @@ interface RecentSearch {
   url: string;
   title: string;
   timestamp: number;
-}
-
-interface HistoryEntry {
-  title: string;
-  url: string;
-  type: 'single' | 'playlist-video' | 'playlist-audio';
-  timestamp: number;
-}
-
-interface VideoFormat {
-  itag: string;
-  mimeType: string;
-  container: string;
-  qualityLabel: string;
-  bitrate: number;
-  hasAudio: boolean;
-  hasVideo: boolean;
-  approxSizeMB: string;
-  type: string;
-}
-
-interface CaptionTrack {
-  languageCode: string;
-  name: string;
-  isAuto: boolean;
 }
 
 interface BatchItem {
@@ -786,7 +762,7 @@ export default function Main() {
                                 <Button
                                   key={f.itag}
                                   variant={selectedItag === f.itag ? 'default' : 'outline'}
-                                  onClick={() => setSelectedItag(f.itag)}
+                                  onClick={() => setSelectedItag(String(f.itag))}
                                   className="text-left justify-start mb-1"
                                 >
                                   <div className="flex flex-col items-start">
@@ -813,7 +789,7 @@ export default function Main() {
                                 <Button
                                   key={f.itag}
                                   variant={selectedItag === f.itag ? 'default' : 'outline'}
-                                  onClick={() => setSelectedItag(f.itag)}
+                                  onClick={() => setSelectedItag(String(f.itag))}
                                   className="text-left justify-start mb-1"
                                 >
                                   <div className="flex flex-col items-start">
@@ -839,7 +815,7 @@ export default function Main() {
                                 <Button
                                   key={f.itag}
                                   variant={selectedItag === f.itag ? 'default' : 'outline'}
-                                  onClick={() => setSelectedItag(f.itag)}
+                                  onClick={() => setSelectedItag(String(f.itag))}
                                   className="text-left justify-start mb-1"
                                 >
                                   <div className="flex flex-col items-start">

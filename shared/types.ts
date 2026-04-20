@@ -1,5 +1,9 @@
-// Shared API contract types for the YT downloader backend.
-// These shapes are what the HTTP/WebSocket endpoints produce and consume.
+// Shared API contract types used by BOTH the backend and the frontend.
+// Single source of truth for anything that crosses the network boundary.
+//
+// Import paths:
+//   Backend:  import type {...} from '../shared/types' (or path alias)
+//   Frontend: import type {...} from '@shared/types'   (via tsconfig paths)
 
 // ---------------------------------------------------------------------------
 // /info response
@@ -106,7 +110,7 @@ export interface CancelRequest {
 }
 
 // ---------------------------------------------------------------------------
-// History entry (shared between frontend and backend responses)
+// Download history (persisted in frontend localStorage)
 // ---------------------------------------------------------------------------
 export type HistoryType = 'single' | 'playlist-video' | 'playlist-audio';
 
