@@ -35,6 +35,7 @@ const {
   validateLangCode,
   cleanUrl,
 } = require('./lib/validators');
+const { env } = require('./lib/env');
 
 // ---------------------------------------------------------------------------
 // Prometheus metrics -- default Node process metrics + custom app metrics
@@ -74,8 +75,8 @@ const downloadsInProgress = new promClient.Gauge({
 // Structured logger -- pretty-printed in dev, JSON in production
 // ---------------------------------------------------------------------------
 const logger = pino({
-  level: process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
-  ...(process.env.NODE_ENV !== 'production' && {
+  level: env.LOG_LEVEL || (env.NODE_ENV === 'production' ? 'info' : 'debug'),
+  ...(env.NODE_ENV !== 'production' && {
     transport: {
       target: 'pino-pretty',
       options: { colorize: true, translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname' },
@@ -84,7 +85,7 @@ const logger = pino({
 });
 
 const app = express();
-const PORT = process.env.PORT || 5001;
+const PORT = env.PORT;
 
 // ---------------------------------------------------------------------------
 // CORS configuration
@@ -92,7 +93,7 @@ const PORT = process.env.PORT || 5001;
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:3001',
-  process.env.FRONTEND_URL
+  env.FRONTEND_URL
 ].filter(Boolean);
 
 app.use(cors({
@@ -136,7 +137,7 @@ app.use((req, res, next) => {
 // var as a comma-separated list. Unset/empty means no privileged keys.
 // ---------------------------------------------------------------------------
 const API_KEYS = new Set(
-  (process.env.API_KEYS || '')
+  (env.API_KEYS || '')
     .split(',')
     .map(k => k.trim())
     .filter(Boolean),
@@ -194,20 +195,20 @@ const activeDownloads = new Set();
 // Enabled when S3_BUCKET env var is set. Works with AWS S3, Cloudflare R2,
 // MinIO, etc. (use S3_ENDPOINT for non-AWS providers).
 // ---------------------------------------------------------------------------
-const S3_BUCKET = process.env.S3_BUCKET || '';
+const S3_BUCKET = env.S3_BUCKET || '';
 const storageEnabled = !!S3_BUCKET;
 let s3Client = null;
 
 if (storageEnabled) {
   const { S3Client } = require('@aws-sdk/client-s3');
   s3Client = new S3Client({
-    region: process.env.S3_REGION || 'auto',
-    endpoint: process.env.S3_ENDPOINT || undefined,
+    region: env.S3_REGION,
+    endpoint: env.S3_ENDPOINT || undefined,
     credentials: {
-      accessKeyId: process.env.S3_ACCESS_KEY_ID,
-      secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      accessKeyId: env.S3_ACCESS_KEY_ID,
+      secretAccessKey: env.S3_SECRET_ACCESS_KEY,
     },
-    forcePathStyle: !!process.env.S3_ENDPOINT,
+    forcePathStyle: !!env.S3_ENDPOINT,
   });
   logger.info({ bucket: S3_BUCKET }, 'Storage backend: S3/R2');
 } else {
@@ -424,7 +425,7 @@ async function processFile({ inputPath, targetExt, startSec, endSec, isAborted, 
 // Cloudflare Turnstile CAPTCHA -- protects high-value endpoints from scraping.
 // No-op when TURNSTILE_SECRET_KEY is unset (graceful fallback).
 // ---------------------------------------------------------------------------
-const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET_KEY || '';
+const TURNSTILE_SECRET = env.TURNSTILE_SECRET_KEY || '';
 const turnstileEnabled = !!TURNSTILE_SECRET;
 
 async function verifyTurnstile(token, ip) {
@@ -877,8 +878,8 @@ async function executeDownload({ url, itag, convertTo, startSec, endSec, trimReq
 // Falls back to direct execution if Redis is unavailable.
 // ---------------------------------------------------------------------------
 const redisConnection = {
-  host: process.env.REDIS_HOST || 'localhost',
-  port: parseInt(process.env.REDIS_PORT || '6379', 10),
+  host: env.REDIS_HOST,
+  port: env.REDIS_PORT,
 };
 
 let downloadQueue = null;
