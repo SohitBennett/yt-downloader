@@ -1,0 +1,13 @@
+{
+  "name": "yt-downloader",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Root tooling for the yt-downloader monorepo (husky + lint-staged).",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.6"
+  }
+}
